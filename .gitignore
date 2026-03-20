@@ -1,0 +1,24 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+.github
+/.agents/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+parquet_output/
+jawiki-latest-pages-articles.xml.bz2
+# DB dump files (大容量のため Git 管理外)
+*.dump
+# Parquet バックアップ (大容量)
+parquet_output_*.tar.gz
+parquet_output_*_part_*
+

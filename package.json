@@ -1,0 +1,33 @@
+{
+  "name": "kb-cli",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Complete local AI knowledge OS with CLI, llama-cli, gemma3, and Obsidian",
+  "bin": {
+    "kb": "./src/interface/cli/main.ts"
+  },
+  "scripts": {
+    "start": "bun run src/interface/http/mcp-server.ts",
+    "dev": "bun --hot run src/interface/http/mcp-server.ts",
+    "link": "bun link",
+    "test": "bun test",
+    "lint": "biome check src tests",
+    "format": "biome format --write src tests",
+    "build": "bunx tsc --noEmit",
+    "prepare": "husky"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "gray-matter": "^4.0.3",
+    "remark-parse": "^11.0.0",
+    "unified": "^11.0.5",
+    "unist-util-visit": "^5.0.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.5",
+    "@types/bun": "^1.1.15",
+    "husky": "^9.1.7",
+    "typescript": "^5.7.2"
+  }
+}

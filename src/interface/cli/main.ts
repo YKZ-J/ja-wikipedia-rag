@@ -1,0 +1,274 @@
+#!/usr/bin/env bun
+/**
+ * KB CLI エントリーポイント
+ *
+ * ローカル LLM で知識ベース管理
+ */
+
+import type { FileResponse, QuestionResponse, SearchResponse } from "../http/mcp-client";
+import {
+  askWikiRag,
+  callMCP,
+  createDoc,
+  createNewsDoc,
+  createWikiDoc,
+  questionDocs,
+  searchAllDocs,
+  searchDocs,
+} from "../http/mcp-client";
+
+const USAGE = `
+Usage:
+  kb "<prompt>"
+  kb create "<title>" [tags...]
+  kb create-wiki "<title>" [tags...]
+  kb create-news "<title>" [tags...]
+  kb search "<query>"
+  kb search-all "<query>"
+  kb question "<query>" "<question>"
+
+Examples:
+  kb "Next.js 16 の最新機能をまとめて"
+  kb "TypeScript の型安全性について整理"
+  kb "今日学んだことをメモ"
+  kb ask-wiki "<質問>" [tags...]
+  kb create "Next.js 16 最新機能" nextjs web
+  kb create-wiki "TypeScript" typescript language
+  kb create-news "TypeScript 最新動向" typescript news
+  kb ask-wiki "富士山の標高は？"
+  kb ask-wiki "東京の人口" wikipedia qa
+  kb search "Next.js"
+  kb search-all "Next.js パフォーマンス"
+  kb question "Next.js パフォーマンス" "Next.js 16 のメリットを簡潔に教えて"
+
+Note: MCP Server must be running:
+  bun run src/interface/http/mcp-server.ts
+`;
+
+const MCP_SERVER_NOTE = "\nIs MCP Server running?\n  bun run src/interface/http/mcp-server.ts";
+
+function handleError(error: unknown): never {
+  const message = error instanceof Error ? error.message : "unknown error";
+  console.error(`✗ Failed: ${message}`);
+  console.error(MCP_SERVER_NOTE);
+  process.exit(1);
+}
+
+function printFileResult(result: FileResponse): void {
+  if (result.ok) {
+    console.log(`✓ Generated: ${result.file}`);
+  } else {
+    console.error(`✗ Error: ${result.error}`);
+    process.exit(1);
+  }
+}
+
+function splitWikiKeywords(input: string): string[] {
+  const normalized = input.replace(/[、，]/g, ",").trim();
+
+  if (!normalized) return [];
+
+  if (normalized.includes(",")) {
+    return normalized
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  return normalized
+    .split(/\s+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function printSearchResult(result: SearchResponse): void {
+  if (!result.ok) {
+    console.error(`✗ Error: ${result.error}`);
+    process.exit(1);
+  }
+
+  const matches = Array.isArray(result.matches) ? result.matches : [];
+  if (matches.length === 0) {
+    console.log("No matches found.");
+    process.exit(0);
+  }
+
+  console.log(`\nFound ${matches.length} matches:`);
+  for (const doc of matches) {
+    const title = (doc?.title as string) || "(untitled)";
+    const slug = (doc?.slug as string) || "";
+    const summary = (doc?.summary as string) || "";
+    const preview = (doc?.preview as string) || "";
+    const docPath = (doc?.path as string) || "";
+
+    console.log(`- ${title}${slug ? ` (${slug})` : ""}`);
+    if (summary) console.log(`  summary: ${summary}`);
+    if (preview) console.log(`  preview: ${preview}`);
+    if (docPath) console.log(`  ${docPath}`);
+  }
+
+  if (result.summary) {
+    console.log("\n=== Summary ===");
+    console.log(result.summary);
+  }
+}
+
+function printQuestionResult(result: QuestionResponse): void {
+  if (!result.ok) {
+    console.error(`✗ Error: ${result.error}`);
+    process.exit(1);
+  }
+
+  const matches = Array.isArray(result.matches) ? result.matches : [];
+  if (matches.length === 0) {
+    console.log("No relevant docs found.");
+    process.exit(0);
+  }
+
+  console.log(`\nFound ${matches.length} docs:`);
+  for (const doc of matches) {
+    const title = (doc?.title as string) || "(untitled)";
+    const summary = (doc?.summary as string) || "";
+    console.log(`- ${title}${summary ? `: ${summary}` : ""}`);
+  }
+
+  if (result.answer) {
+    console.log("\n=== Answer ===");
+    console.log(result.answer);
+  }
+}
+
+async function runSearch(args: string[], isAll: boolean): Promise<void> {
+  const query = args.join(" ");
+  if (!query) {
+    console.error("✗ Error: query required");
+    process.exit(1);
+  }
+  console.log(`[KB CLI] Searching${isAll ? " (all keywords)" : ""}: "${query}"`);
+  const result = isAll ? await searchAllDocs(query) : await searchDocs(query);
+  printSearchResult(result);
+}
+
+async function runQuestion(args: string[]): Promise<void> {
+  const query = args[0] || "";
+  const question = args.slice(1).join(" ");
+  if (!query || !question) {
+    console.error("✗ Error: query and question required");
+    process.exit(1);
+  }
+  console.log(`[KB CLI] Question: "${query}" / "${question}"`);
+  const result = await questionDocs(query, question);
+  printQuestionResult(result);
+}
+
+async function runCreate(args: string[]): Promise<void> {
+  const title = args[0] || "";
+  const tags = args.slice(1);
+  if (!title) {
+    console.error("✗ Error: title required");
+    process.exit(1);
+  }
+  console.log(`[KB CLI] Creating: "${title}"`);
+  const result = await createDoc(title, tags);
+  printFileResult(result);
+}
+
+async function runCreateWiki(args: string[]): Promise<void> {
+  const title = args[0] || "";
+  const tags = args.slice(1);
+  if (!title) {
+    console.error("✗ Error: title required");
+    process.exit(1);
+  }
+
+  const keywords = splitWikiKeywords(title);
+  if (keywords.length === 0) {
+    console.error("✗ Error: valid keyword required");
+    process.exit(1);
+  }
+
+  if (keywords.length === 1) {
+    console.log(`[KB CLI] Creating from Wikipedia: "${keywords[0]}"`);
+    const result = await createWikiDoc(keywords[0], tags);
+    printFileResult(result);
+    return;
+  }
+
+  console.log(`[KB CLI] Creating from Wikipedia (${keywords.length} keywords)...`);
+  let failed = 0;
+
+  for (const keyword of keywords) {
+    console.log(`- keyword: "${keyword}"`);
+    const result = await createWikiDoc(keyword, tags);
+    if (result.ok) {
+      console.log(`  ✓ Generated: ${result.file}`);
+    } else {
+      failed += 1;
+      console.error(`  ✗ Error: ${result.error}`);
+    }
+  }
+
+  if (failed > 0) {
+    console.error(`✗ Failed keywords: ${failed}/${keywords.length}`);
+    process.exit(1);
+  }
+}
+
+async function runCreateNews(args: string[]): Promise<void> {
+  const title = args[0] || "";
+  const tags = args.slice(1);
+  if (!title) {
+    console.error("✗ Error: title required");
+    process.exit(1);
+  }
+  console.log(`[KB CLI] Creating news article: "${title}"`);
+  const result = await createNewsDoc(title, tags);
+  printFileResult(result);
+}
+
+async function runAskWiki(args: string[]): Promise<void> {
+  const query = args[0] || "";
+  const tags = args.slice(1);
+  if (!query) {
+    console.error("✗ Error: query required");
+    process.exit(1);
+  }
+  console.log(`[KB CLI] Wikipedia RAG: "${query}"`);
+  const result = await askWikiRag(query, tags);
+  printFileResult(result);
+}
+
+async function runDefault(args: string[]): Promise<void> {
+  console.log("[KB CLI] Generating document...");
+  const result = await callMCP(args.join(" "));
+  printFileResult(result);
+}
+
+// ---- コマンドディスパッチ ----
+
+const [, , ...rawArgs] = process.argv;
+
+if (rawArgs.length === 0) {
+  console.log(USAGE);
+  process.exit(1);
+}
+
+const [command, ...rest] = rawArgs;
+
+const COMMAND_HANDLERS: Record<string, () => Promise<void>> = {
+  search: () => runSearch(rest, false),
+  "search-all": () => runSearch(rest, true),
+  question: () => runQuestion(rest),
+  create: () => runCreate(rest),
+  "create-wiki": () => runCreateWiki(rest),
+  "create-news": () => runCreateNews(rest),
+  "ask-wiki": () => runAskWiki(rest),
+};
+
+const handler = command in COMMAND_HANDLERS ? COMMAND_HANDLERS[command] : () => runDefault(rawArgs);
+
+try {
+  await handler();
+} catch (error: unknown) {
+  handleError(error);
+}
