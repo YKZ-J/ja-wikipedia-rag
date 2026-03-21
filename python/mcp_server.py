@@ -97,7 +97,7 @@ _RE_INSTRUCTION_SUFFIX = re.compile(
 )
 # 文字数指定・詳細度修飾語を除去（例: "1500文字程度で詳しく" "500文字で"）
 _RE_DETAIL_SPEC = re.compile(
-    r"\d+\s*文字\s*(?:程度|以上|以内|ほど)?\s*(?:で\s*)?(?:できるだけ\s*)?(?:詳しく\s*|詳細に\s*)?|(?:できるだけ\s*)?(?:詳しく|詳細に)\s*$|できるだけ\s*$"
+    r"\d+\s*(?:文字|字)\s*(?:程度|以上|以内|ほど)?\s*(?:で\s*)?(?:できるだけ\s*)?(?:詳しく\s*|詳細に\s*)?|(?:できるだけ\s*)?(?:詳しく|詳細に)\s*$|できるだけ\s*$"
 )
 _RE_LATIN_TOKEN = re.compile(r"[a-zA-Z]{2,16}")
 # フォールバック抽出は漢字/カタカナ中心に限定してノイズを抑える
@@ -122,13 +122,17 @@ _GENERIC_SECONDARY_QUERIES = {
     "人気",
     "有名",
     "文字程度",  # 「1500文字程度で」の残滓除去用
+    "字程度",  # 「1500字程度で」の残滓除去用
     "詳細",
+    "それぞれ",
 }
 
 # 英字略語を日本語見出し語に展開する辞書
 _LATIN_QUERY_VARIANTS = {
     "gdp": ["GDP", "国内総生産"],
     "ai": ["AI", "人工知能"],
+    "apple": ["Apple", "アップル"],
+    "microsoft": ["Microsoft", "マイクロソフト"],
 }
 
 # ============================================================
@@ -473,12 +477,9 @@ def _extract_search_queries(query: str) -> tuple[str, list[str], list[str]]:
         r"([\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]{1,14})\u3068\u306e",
         search_base,
     )
-    nouns_no = _re.findall(
-        r"([\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]{1,14})\u306e",
-        search_base,
-    )
+    nouns_no = _re.findall(r"([^の\s、。]{1,14})\u306e", search_base)
     phrase_pairs = _re.findall(
-        r"([\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]{1,14})\u306e([\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]{1,14})",
+        r"([^の\s、。]{1,14})\u306e([^の\s、。]{1,14})",
         search_base,
     )
 
@@ -501,13 +502,19 @@ def _extract_search_queries(query: str) -> tuple[str, list[str], list[str]]:
         """英字略語をタイトル検索しやすい語へ展開する。"""
         lower_base = search_base.lower()
         has_japan_context = "日本" in search_base
-        for token in _RE_LATIN_TOKEN.findall(search_base):
+        latin_tokens = list(dict.fromkeys(_RE_LATIN_TOKEN.findall(search_base)))
+        if len(latin_tokens) >= 2:
+            # 複数英字語を1クエリに束ねて company 対比質問へ対応
+            add_query_term(" ".join(latin_tokens))
+
+        for token in latin_tokens:
             key = token.lower()
+            # 一般英字語もそのまま補助クエリとして活用
+            add_query_term(token.lower())
+            add_query_term(token.capitalize())
+
             if key not in _LATIN_QUERY_VARIANTS:
                 continue
-            # 元トークンも明示的に残す（gdp -> GDP/gdp）
-            add_query_term(token)
-            add_query_term(token.upper())
             for variant in _LATIN_QUERY_VARIANTS[key]:
                 add_query_term(variant)
                 if has_japan_context and " " not in variant and variant not in lower_base:
@@ -545,6 +552,8 @@ def _extract_search_queries(query: str) -> tuple[str, list[str], list[str]]:
     for noun in nouns_nitsuite:
         if "の" in noun:
             continue
+        if any(stop in noun for stop in ("特に", "季節ごと", "季節ごとの")):
+            continue
         for variant in expand_variants(noun):
             add_query_term(variant)
 
@@ -553,6 +562,8 @@ def _extract_search_queries(query: str) -> tuple[str, list[str], list[str]]:
         if "の" in noun:
             continue
         if noun in _GENERIC_SECONDARY_QUERIES:
+            continue
+        if any(stop in noun for stop in ("特に", "季節ごと", "季節ごとの")):
             continue
         for variant in expand_variants(noun):
             add_query_term(variant)
@@ -573,6 +584,21 @@ def _extract_search_queries(query: str) -> tuple[str, list[str], list[str]]:
             if right == "イベント":
                 add_query_term(f"{left} 観光", with_title=False)
 
+    # 「Xの〜観光/イベント/祭り」形式は、地名・主題を組み合わせた補助語を追加する
+    has_tourism_intent = any(k in search_base for k in ("観光", "イベント", "祭", "祭り"))
+    if has_tourism_intent:
+        for head in nouns_no:
+            if "の" in head:
+                continue
+            if head in _GENERIC_SECONDARY_QUERIES:
+                continue
+            # 「季節ごと」のような時制・汎用フレーズは除外
+            if any(stop in head for stop in ("季節", "ごと", "特に")):
+                continue
+            add_query_term(f"{head} 観光")
+            if any(k in search_base for k in ("イベント", "祭", "祭り")):
+                add_query_term(f"{head} イベント")
+
     # 英字略語（GDP など）の補助語を追加
     add_latin_variants()
 
@@ -580,13 +606,45 @@ def _extract_search_queries(query: str) -> tuple[str, list[str], list[str]]:
     for token in _RE_JP_KEYWORD.findall(search_base):
         if token in _GENERIC_SECONDARY_QUERIES:
             continue
+        if token.startswith("特に"):
+            continue
         if len(token) >= 2 or _is_single_kanji(token):
             for variant in expand_variants(token):
                 add_query_term(variant)
         if len(vector_queries) >= 5:
             break
 
-    return search_base, vector_queries[:5], title_queries[:4]
+    location_heads = {
+        n
+        for n in nouns_no
+        if n
+        and n not in _GENERIC_SECONDARY_QUERIES
+        and not any(stop in n for stop in ("特に", "季節", "ごと"))
+    }
+
+    def _priority(term: str) -> tuple[int, int]:
+        score = 0
+        if any(k in term for k in ("観光", "名所", "観光地", "イベント", "祭", "春", "桜")):
+            score += 26
+        if _RE_LATIN_TOKEN.fullmatch(term):
+            score += 34
+        elif _RE_LATIN_TOKEN.search(term):
+            score += 10
+        if " " in term:
+            score += 8
+        if term in location_heads:
+            score += 42
+        if term.startswith("特に"):
+            score -= 25
+        if term in _GENERIC_SECONDARY_QUERIES:
+            score -= 20
+        return score, len(term)
+
+    vector_tail = sorted(vector_queries[1:], key=_priority, reverse=True)
+    prioritized_vector_queries = [vector_queries[0], *vector_tail][:5]
+    prioritized_title_queries = sorted(title_queries, key=_priority, reverse=True)[:4]
+
+    return search_base, prioritized_vector_queries, prioritized_title_queries
 
 
 def _merge_ranked_docs(
@@ -647,23 +705,55 @@ async def _retrieve_rag_docs(
     import asyncpg
 
     _, all_vector_queries, all_title_queries = _extract_search_queries(query)
+    latin_terms = list(dict.fromkeys([token.lower() for token in _RE_LATIN_TOKEN.findall(query)]))
 
     # 速度最適化: 検索クエリ本数を最小化
     # - vector: 質問全文 1件
     # - title: 補助 1件（ただし観光/イベント等の意図語を優先）
     vector_queries = all_vector_queries[:1]
+    if len(latin_terms) >= 2:
+        combined_latin = " ".join(latin_terms[:2])
+        if combined_latin in all_vector_queries:
+            vector_queries = [all_vector_queries[0], combined_latin]
+        else:
+            vector_queries = [all_vector_queries[0], latin_terms[0]]
     # 英字略語を含む質問は、日本語同義語を優先して補助ベクトルに採用する
-    if any(_RE_LATIN_TOKEN.search(q) for q in all_vector_queries[:1]) and len(all_vector_queries) > 1:
+    elif any(_RE_LATIN_TOKEN.search(q) for q in all_vector_queries[:1]) and len(all_vector_queries) > 1:
         extra_query = all_vector_queries[1]
+        picked_latin = False
         for candidate in all_vector_queries[1:]:
-            if any("\u3040" <= ch <= "\u30ff" or "\u4e00" <= ch <= "\u9fff" for ch in candidate):
+            has_latin = bool(_RE_LATIN_TOKEN.search(candidate))
+            has_japanese = any("\u3040" <= ch <= "\u30ff" or "\u4e00" <= ch <= "\u9fff" for ch in candidate)
+            if has_latin and not has_japanese:
                 extra_query = candidate
+                picked_latin = True
                 break
+        if not picked_latin:
+            for candidate in all_vector_queries[1:]:
+                if any("\u3040" <= ch <= "\u30ff" or "\u4e00" <= ch <= "\u9fff" for ch in candidate):
+                    extra_query = candidate
+                    break
         vector_queries = [all_vector_queries[0], extra_query]
+    # 観光/イベント系は地名+意図語の補助ベクトルを1本追加してノイズ耐性を上げる
+    elif any(k in query for k in ("観光", "イベント", "祭", "祭り", "春", "花見")):
+        for candidate in all_vector_queries[1:]:
+            if any(k in candidate for k in ("観光", "イベント", "祭", "祭り")):
+                vector_queries = [all_vector_queries[0], candidate]
+                break
     title_candidates = list(dict.fromkeys(all_title_queries))
+    if latin_terms:
+        boosted_latin = []
+        for token in latin_terms:
+            boosted_latin.extend([token, token.capitalize()])
+            for variant in _LATIN_QUERY_VARIANTS.get(token, []):
+                boosted_latin.append(variant)
+        title_candidates = list(dict.fromkeys(boosted_latin + title_candidates))
+
     if not title_candidates and len(all_vector_queries) > 1:
         # タイトル候補が空のときは補助ベクトル語をフォールバック採用
         title_candidates = [q for q in all_vector_queries[1:] if len(q) <= 24][:2]
+
+    location_heads = set(re.findall(r"([^の\s、。]{1,14})\u306e", query))
 
     def title_priority(term: str) -> tuple[int, int]:
         score = 0
@@ -671,12 +761,19 @@ async def _retrieve_rag_docs(
             score += 30
         if " " in term:
             score += 8
+        if term in location_heads:
+            score += 45
+        if term.startswith("特に"):
+            score -= 20
         if term in _GENERIC_SECONDARY_QUERIES:
             score -= 20
         return score, len(term)
 
     title_candidates.sort(key=title_priority, reverse=True)
-    title_queries = title_candidates[:2]
+    if len(latin_terms) >= 2:
+        title_queries = latin_terms[:2]
+    else:
+        title_queries = title_candidates[:2]
     # アンカー語は検索に使わない分も保持して再ランキングで活用
     anchor_terms = [q for q in all_vector_queries[1:4] if q]
     for tq in title_queries:
@@ -801,7 +898,25 @@ async def _retrieve_rag_docs(
     primary_vector_docs = vector_lists[0] if vector_lists else []
     secondary_vector_lists = vector_lists[1:] if len(vector_lists) > 1 else []
     docs = _merge_ranked_docs(primary_vector_docs, secondary_vector_lists, title_lists, anchor_terms)
-    # Gemma3 入力は 10 件固定のため検索候補もここで 10 件に制限
+
+    is_tourism_query = any(k in query for k in ("観光", "イベント", "祭", "祭り", "春", "花見"))
+    if is_tourism_query and docs:
+        anchor_parts = [
+            part
+            for term in anchor_terms
+            for part in term.split(" ")
+            if part and part not in _GENERIC_SECONDARY_QUERIES
+        ]
+        if anchor_parts:
+            filtered_docs = []
+            for doc in docs:
+                title = doc["title"]
+                if any(part in title for part in anchor_parts):
+                    filtered_docs.append(doc)
+            if filtered_docs:
+                docs = filtered_docs
+
+    # Gemma3 入力は最大 10 件（高精度優先で不足時は件数を減らす）
     return docs[:10], vector_queries, title_lists
 
 

@@ -91,6 +91,14 @@ TEST_CASES: list[tuple[str, list[str]]] = [
     ("日本の絶滅危惧種の生物を1500文字程度で詳しく教えて", ["絶滅危惧種", "生物"]),
     ("日本のgdpの推移を1500文字程度で詳しく教えて", ["gdp", "推移", "国内総生産"]),
     (
+        "appleとmicrosoftについてそれぞれ1500字程度で説明して",
+        ["apple", "microsoft", "Apple", "Microsoft", "アップル", "マイクロソフト"],
+    ),
+    (
+        "AppleとMicrosoftの違いを詳しく教えて",
+        ["Apple", "Microsoft", "アップル", "マイクロソフト"],
+    ),
+    (
         "アイヌ民族について教えて。世界の少数民族との共通点も教えて。3000文字程度でできるだけ詳しく解説して",
         ["アイヌ民族", "少数民族", "共通点"],
     ),
@@ -129,6 +137,18 @@ TUNING_CASES_30: list[tuple[str, list[str]]] = [
     ("アイヌ文化と北海道の観光地の関係を教えて", ["アイヌ", "北海道", "観光"]),
     ("北海道の花見イベントと観光名所を教えて", ["北海道", "花見", "イベント", "観光"]),
     ("北海道の春祭りと観光地を教えて", ["北海道", "春", "祭", "観光地"]),
+    (
+        "札幌の季節ごとの観光イベントを教えて。特に春について詳しく教えて",
+        ["札幌", "観光", "イベント", "春"],
+    ),
+    ("札幌の春の観光イベントを詳しく教えて", ["札幌", "春", "観光", "イベント"]),
+]
+
+LATIN_DB_REGRESSION_CASES: list[tuple[str, list[str]]] = [
+    (
+        "appleとmicrosoftについてそれぞれ1500字程度で説明して",
+        ["apple", "microsoft", "アップル", "マイクロソフト"],
+    ),
 ]
 
 
@@ -136,7 +156,7 @@ def run_fast_extraction_test() -> tuple[int, list[tuple[str, list[str], list[str
     passed = 0
     failed: list[tuple[str, list[str], list[str]]] = []
 
-    print("=== FAST EXTRACTION TEST (40 cases) ===")
+    print(f"=== FAST EXTRACTION TEST ({len(TEST_CASES)} cases) ===")
     for i, (query, expected_terms) in enumerate(TEST_CASES, 1):
         _, vq, _ = _extract_search_queries(query)
         has_expected = any(any(term in q for q in vq) for term in expected_terms)
@@ -157,7 +177,7 @@ def run_tuning_extraction_test() -> tuple[int, list[tuple[str, list[str], list[s
     passed = 0
     failed: list[tuple[str, list[str], list[str]]] = []
 
-    print("\n=== TUNING EXTRACTION TEST (30 cases) ===")
+    print(f"\n=== TUNING EXTRACTION TEST ({len(TUNING_CASES_30)} cases) ===")
     for i, (query, expected_terms) in enumerate(TUNING_CASES_30, 1):
         _, vq, tq = _extract_search_queries(query)
         joined = " ".join(vq + tq)
@@ -222,6 +242,39 @@ async def run_db_smoke_test(
         mark = "✓" if ok else "✗"
         top1 = titles[0] if titles else "NONE"
         print(f"{i:>2}. {mark} {query[:35]:<36} top1={top1[:28]:<28} vq0={vq[0][:24]}")
+        if ok:
+            passed += 1
+        else:
+            failed.append((query, expected_terms, titles))
+
+    return passed, failed
+
+
+async def run_latin_db_regression_test(
+    per_query_timeout_sec: float = 15.0,
+) -> tuple[int, list[tuple[str, list[str], list[str]]]]:
+    passed = 0
+    failed: list[tuple[str, list[str], list[str]]] = []
+    db_url = get_db_url()
+
+    print(f"\n=== LATIN DB REGRESSION TEST ({len(LATIN_DB_REGRESSION_CASES)} cases) ===")
+    for i, (query, expected_terms) in enumerate(LATIN_DB_REGRESSION_CASES, 1):
+        try:
+            docs, vq, _ = await asyncio.wait_for(
+                _retrieve_rag_docs(query, db_url),
+                timeout=per_query_timeout_sec,
+            )
+        except TimeoutError:
+            failed.append((query, expected_terms, ["TIMEOUT"]))
+            print(f"{i:>2}. ✗ {query[:35]:<36} top1={'TIMEOUT':<28} vq={vq if 'vq' in locals() else []}")
+            continue
+
+        titles = [d["title"] for d in docs[:10]]
+        joined = " ".join(titles).lower()
+        ok = "apple" in joined and "microsoft" in joined
+        mark = "✓" if ok else "✗"
+        top1 = titles[0] if titles else "NONE"
+        print(f"{i:>2}. {mark} {query[:35]:<36} top1={top1[:28]:<28} vq={vq[:2]}")
         if ok:
             passed += 1
         else:
@@ -392,6 +445,20 @@ async def main() -> None:
         if t_db_failed:
             print("\nTUNING30 DB FAILED CASES:")
             for q, exp, tops in t_db_failed:
+                print(f"- Q: {q}")
+                print(f"  expected: {exp}")
+                print(f"  top: {tops[:5]}")
+
+    if args.db:
+        latin_passed, latin_failed = await run_latin_db_regression_test(
+            per_query_timeout_sec=max(12.0, args.db_timeout),
+        )
+        latin_total = len(LATIN_DB_REGRESSION_CASES)
+        latin_rate = latin_passed / latin_total if latin_total else 1.0
+        print(f"\nLATIN DB REGRESSION RESULT: {latin_passed}/{latin_total} ({latin_rate:.1%})")
+        if latin_failed:
+            print("\nLATIN DB REGRESSION FAILED CASES:")
+            for q, exp, tops in latin_failed:
                 print(f"- Q: {q}")
                 print(f"  expected: {exp}")
                 print(f"  top: {tops[:5]}")
