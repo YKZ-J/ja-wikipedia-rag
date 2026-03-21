@@ -15,7 +15,7 @@ import { searchAllDocs, searchDocs } from "../../application/use-cases/search-do
 import {
   runPythonLLM,
   runPythonRAGDoc,
-  runPythonSummary,
+  runPythonSummaryWithMode,
 } from "../../infrastructure/llm/llama-bridge";
 import { getTokyoDateString } from "../../shared/lib/date";
 
@@ -142,7 +142,7 @@ function createMcpServer(): McpServer {
       const filePath = await createNewsArticle({
         title,
         tags,
-        summarize: runPythonSummary,
+        summarize: (prompt) => runPythonSummaryWithMode(prompt, "news_article"),
       });
       console.log(`[MCP] Generated news: ${filePath}`);
       return jsonText({ file: filePath });
@@ -160,7 +160,9 @@ function createMcpServer(): McpServer {
     },
     async ({ query }) => {
       console.log(`[MCP] search_docs: "${query}"`);
-      const result = await searchDocs(query, runPythonSummary);
+      const result = await searchDocs(query, (prompt) =>
+        runPythonSummaryWithMode(prompt, "search_summary"),
+      );
       return jsonText(result);
     },
   );
@@ -176,7 +178,9 @@ function createMcpServer(): McpServer {
     },
     async ({ query }) => {
       console.log(`[MCP] search_all_docs: "${query}"`);
-      const result = await searchAllDocs(query, runPythonSummary);
+      const result = await searchAllDocs(query, (prompt) =>
+        runPythonSummaryWithMode(prompt, "search_summary"),
+      );
       return jsonText(result);
     },
   );
@@ -199,7 +203,7 @@ function createMcpServer(): McpServer {
         return jsonText({ matches: [], answer: "" });
       }
       const llmPrompt = buildQuestionPrompt(matches, question);
-      const answer = await runPythonSummary(llmPrompt);
+      const answer = await runPythonSummaryWithMode(llmPrompt, "qa_non_rag");
       return jsonText({ matches, answer });
     },
   );
@@ -243,7 +247,7 @@ function createMcpServer(): McpServer {
         tags,
         createRagDoc: runPythonRAGDoc,
         createWikiDoc: (keyword, wikiTags) => createDocFromWikipedia({ keyword, tags: wikiTags }),
-        summarize: runPythonSummary,
+        summarize: (prompt) => runPythonSummaryWithMode(prompt, "qa_non_rag"),
       });
       console.log(`[MCP] Generated comparison: ${filePath}`);
       return jsonText({ file: filePath });

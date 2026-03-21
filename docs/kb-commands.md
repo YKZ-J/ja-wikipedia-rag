@@ -14,6 +14,27 @@ kb <command> "<引数>" [タグ...]
 
 ## コマンド一覧
 
+## コマンド別 Prompt / LLM Parameters
+
+以下は、各 `kb` コマンドで実際に使われる Prompt と LLM パラメータの対応です。
+
+| CLIコマンド         | 内部ツール/経路                                                                   | Prompt                                                                                                                                  | LLMパラメータ                                                                                                                                                                           |
+| ------------------- | --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kb "<プロンプト>"` | `generate_from_prompt` → Python `generate_doc`                                    | CLI入力をそのまま使用                                                                                                                   | preset `doc_generation`: `max_tokens=8192`, `temperature=0.7`, `top_k=50`, `repeat_penalty=1.1`                                                                                         |
+| `kb create`         | `create_doc` → `buildCreatePrompt()` → Python `generate_doc`                      | タイトル/タグを埋め込んだ固定テンプレート                                                                                               | preset `doc_generation`: `max_tokens=8192`, `temperature=0.7`, `top_k=50`, `repeat_penalty=1.1`                                                                                         |
+| `kb create-wiki`    | `create_doc_wiki` → `createDocFromWikipedia()`                                    | Wikipedia APIベース（LLM未使用）                                                                                                        | なし                                                                                                                                                                                    |
+| `kb create-news`    | `create_news` → `createNewsArticle()` → Python `summarize(mode="news_article")`   | `docs/news-writter-prompt.md` + 追加指示 + ソース本文                                                                                   | preset `news_article`: `max_tokens=8192`, `temperature=0.7`, `top_k=50`, `repeat_penalty=1.1`                                                                                           |
+| `kb search`         | `search_docs` → Python `summarize(mode="search_summary")`                         | 検索結果上位を要約する固定テンプレート                                                                                                  | preset `search_summary`: `max_tokens=700`, `temperature=0.2`, `top_k=20`, `repeat_penalty=1.05`                                                                                         |
+| `kb search-all`     | `search_all_docs` → Python `summarize(mode="search_summary")`                     | 検索結果上位を要約する固定テンプレート                                                                                                  | preset `search_summary`: `max_tokens=700`, `temperature=0.2`, `top_k=20`, `repeat_penalty=1.05`                                                                                         |
+| `kb question`       | `question_docs` → `buildQuestionPrompt()` → Python `summarize(mode="qa_non_rag")` | 関連ドキュメント抜粋 + 質問を埋め込むテンプレート                                                                                       | preset `qa_non_rag`: `max_tokens=2600`, `temperature=0.5`, `top_k=40`, `repeat_penalty=1.08`                                                                                            |
+| `kb ask-wiki`       | `ask_wiki_rag` → Python `rag_ask`                                                 | 2段階: 1) 質問整形Prompt 2) RAG回答Prompt (`_build_rag_prompt`)                                                                         | 1) 質問整形(Ollama): `temperature=0.0`, `num_predict=128` 2) RAG回答(Ollama): `num_ctx=30000`, `num_predict=10000`, `temperature=0.15`, `top_k=15`, `top_p=0.85`, `repeat_penalty=1.03` |
+| `kb compare-wiki`   | `create_wiki_rag_comparison`                                                      | **RAGあり**: `ask-wiki` と同一。**RAGなし**: `buildNonRagPrompt()`（一般知識のみで回答）を Python `summarize(mode="qa_non_rag")` へ入力 | **RAGあり**: `ask-wiki` と同一（質問整形 + RAG回答）。**RAGなし**: preset `qa_non_rag`: `max_tokens=2600`, `temperature=0.5`, `top_k=40`, `repeat_penalty=1.08`                         |
+
+補足:
+
+- Python 側 `summarize` は `mode` ごとに Prompt ラップ有無とパラメータを切り替える。
+- `ask-wiki` / `compare-wiki(RAGあり)` の最終回答は `summarize` を使わず、`rag_ask` 内の RAG 専用 Prompt を使用する。
+
 ### `kb "<プロンプト>"` — LLM ドキュメント生成（デフォルト）
 
 任意のプロンプトを LLM に渡して Markdown ドキュメントを Vault に保存する。

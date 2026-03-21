@@ -19,6 +19,7 @@ import re
 import secrets
 import sys
 import unicodedata
+from collections import OrderedDict
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -134,6 +135,110 @@ _LATIN_QUERY_VARIANTS = {
     "apple": ["Apple", "アップル"],
     "microsoft": ["Microsoft", "マイクロソフト"],
 }
+
+# Wikipedia見出しでヒットしやすい正式名称への正規化辞書
+_JP_QUERY_CANONICAL_VARIANTS = {
+    "首相": ["内閣総理大臣", "総理大臣", "内閣総理大臣の一覧"],
+    "総理": ["内閣総理大臣", "総理大臣"],
+}
+
+_QUERY_EXTRACTION_CACHE_MAX = int(os.environ.get("RAG_QUERY_CACHE_MAX", "256"))
+_EMBED_CACHE_MAX = int(os.environ.get("RAG_EMBED_CACHE_MAX", "512"))
+_QUERY_NORMALIZATION_TIMEOUT_SEC = float(
+    os.environ.get("RAG_QUERY_NORMALIZATION_TIMEOUT_SEC", "12")
+)
+_QUERY_NORMALIZATION_NUM_PREDICT = int(
+    os.environ.get("RAG_QUERY_NORMALIZATION_NUM_PREDICT", "64")
+)
+_query_extraction_cache: "OrderedDict[str, tuple[str, list[str], list[str]]]" = OrderedDict()
+_embed_cache: "OrderedDict[str, list[float]]" = OrderedDict()
+
+_LLAMA_PRESETS: dict[str, dict[str, float | int]] = {
+    # ドキュメント生成は本文品質優先
+    "doc_generation": {
+        "max_tokens": 8192,
+        "temperature": 0.7,
+        "top_k": 50,
+        "repeat_penalty": 1.1,
+    },
+    # 非RAGの短い要約・回答は最小限パラメータで高速化
+    "non_rag_minimal": {
+        "max_tokens": 1024,
+        "temperature": 0.3,
+        "top_k": 20,
+        "repeat_penalty": 1.05,
+    },
+    # 検索結果の短文要約向け
+    "search_summary": {
+        "max_tokens": 700,
+        "temperature": 0.2,
+        "top_k": 20,
+        "repeat_penalty": 1.05,
+    },
+    # 非RAGの質問応答向け（compare-wiki の RAGなし回答、question など）
+    "qa_non_rag": {
+        "max_tokens": 2600,
+        "temperature": 0.5,
+        "top_k": 40,
+        "repeat_penalty": 1.08,
+    },
+    # ニュース記事生成向け（長文）
+    "news_article": {
+        "max_tokens": 8192,
+        "temperature": 0.7,
+        "top_k": 50,
+        "repeat_penalty": 1.1,
+    },
+}
+
+_SUMMARIZE_MODE_DEFAULT = "non_rag_minimal"
+_SUMMARIZE_MODE_MAP: dict[str, tuple[str, bool]] = {
+    # mode: (preset, wrap_non_rag_prompt)
+    "non_rag_minimal": ("non_rag_minimal", True),
+    "search_summary": ("search_summary", False),
+    "qa_non_rag": ("qa_non_rag", False),
+    "news_article": ("news_article", False),
+}
+
+
+def _lru_get(cache: "OrderedDict[str, object]", key: str):
+    value = cache.get(key)
+    if value is None:
+        return None
+    cache.move_to_end(key)
+    return value
+
+
+def _lru_set(cache: "OrderedDict[str, object]", key: str, value: object, max_size: int) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_size:
+        cache.popitem(last=False)
+
+
+def _build_non_rag_prompt(user_prompt: str) -> str:
+    """Wikipedia RAG を使わない通常要約・応答向けプロンプト。"""
+    return (
+        "あなたは日本語の要約・応答アシスタントです。\n"
+        "与えられた指示に対して、簡潔で読みやすい日本語で回答してください。\n"
+        "不要な前置きは省き、要求された内容に直接答えてください。\n\n"
+        f"User Prompt:\n{user_prompt}\n\n"
+        "Answer:"
+    )
+
+
+def _run_llama_with_preset(prompt: str, preset: str) -> str:
+    """llama.cpp をプリセット設定で実行してテキストを返す。"""
+    llm = get_llm()
+    params = _LLAMA_PRESETS[preset]
+    result = llm(
+        prompt=prompt,
+        max_tokens=int(params["max_tokens"]),
+        temperature=float(params["temperature"]),
+        top_k=int(params["top_k"]),
+        repeat_penalty=float(params["repeat_penalty"]),
+    )
+    return str(result["choices"][0]["text"]).strip()
 
 # ============================================================
 # LLM シングルトン（遅延初期化）
@@ -350,15 +455,7 @@ def generate_doc(
     out_dir = Path(vault_dir or DEFAULT_VAULT_PATH)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    llm = get_llm()
-    result = llm(
-        prompt=prompt,
-        max_tokens=8192,
-        temperature=0.7,
-        top_k=50,
-        repeat_penalty=1.1,
-    )
-    text: str = result["choices"][0]["text"]
+    text = _run_llama_with_preset(prompt, "doc_generation")
 
     # Markdown パース
     fm_text, body_text = split_frontmatter(text)
@@ -413,22 +510,17 @@ def generate_doc(
 
 
 @mcp.tool()
-def summarize(prompt: str) -> str:
+def summarize(prompt: str, mode: str = _SUMMARIZE_MODE_DEFAULT) -> str:
     """
     プロンプトを LLM に渡してテキストを返す（要約・質問応答用）。
 
     Args:
         prompt: LLM に渡すプロンプト文字列
+        mode:   プロンプト/パラメータのプリセット
     """
-    llm = get_llm()
-    result = llm(
-        prompt=prompt,
-        max_tokens=2048,
-        temperature=0.7,
-        top_k=50,
-        repeat_penalty=1.1,
-    )
-    return result["choices"][0]["text"].strip()
+    preset, wrap_prompt = _SUMMARIZE_MODE_MAP.get(mode, _SUMMARIZE_MODE_MAP[_SUMMARIZE_MODE_DEFAULT])
+    llm_prompt = _build_non_rag_prompt(prompt) if wrap_prompt else prompt
+    return _run_llama_with_preset(llm_prompt, preset)
 
 
 # ============================================================
@@ -442,7 +534,7 @@ def get_db_url() -> str:
     )
 
 
-def _extract_search_queries(query: str) -> tuple[str, list[str], list[str]]:
+def _extract_search_queries_rule_based(query: str) -> tuple[str, list[str], list[str]]:
     """質問文から検索クエリを抽出する。
 
     Returns:
@@ -647,6 +739,179 @@ def _extract_search_queries(query: str) -> tuple[str, list[str], list[str]]:
     return search_base, prioritized_vector_queries, prioritized_title_queries
 
 
+def _normalize_query_term(term: str) -> str:
+    """検索クエリ用の語を正規化する。"""
+    cleaned = " ".join(term.strip().split())
+    return cleaned[:300]
+
+
+def _apply_canonical_replacements(term: str) -> str:
+    """通称をWikipedia見出しに寄せた正式名称へ置換する。"""
+    normalized = term
+    for short, variants in _JP_QUERY_CANONICAL_VARIANTS.items():
+        # 置換後語の再置換（例: 内閣総理大臣 -> 内閣内閣総理大臣大臣）を防ぐ
+        if not variants:
+            continue
+        if any(variant in term for variant in variants):
+            continue
+        if short in term:
+            normalized = normalized.replace(short, variants[0])
+    return _normalize_query_term(normalized)
+
+
+def _expand_canonical_variants(terms: list[str]) -> list[str]:
+    """クエリ候補へ正式名称バリエーションを追加する。"""
+    expanded: list[str] = []
+    seen: set[str] = set()
+
+    def add_term(value: str) -> None:
+        cleaned = _normalize_query_term(value)
+        if not cleaned or cleaned in seen:
+            return
+        seen.add(cleaned)
+        expanded.append(cleaned)
+
+    for term in terms:
+        add_term(term)
+        for short, variants in _JP_QUERY_CANONICAL_VARIANTS.items():
+            if not variants:
+                continue
+            if short not in term:
+                continue
+            if any(variant in term for variant in variants):
+                continue
+            for variant in variants:
+                add_term(term.replace(short, variant))
+
+    return expanded
+
+
+def _parse_json_object_from_text(text: str) -> dict | None:
+    """モデル出力テキストからJSONオブジェクトを抽出する。"""
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        return None
+
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str], list[str]]:
+    """Gemma3 で質問整形を行い、検索クエリ候補を返す。"""
+    import aiohttp
+
+    prompt = (
+        "あなたはWikipedia検索用のクエリ整形アシスタントです。\n"
+        "ユーザー質問を、意味を変えずに検索しやすい形へ整形してください。\n"
+        "出力は必ずJSONオブジェクトのみで返してください。説明文は禁止です。\n\n"
+        "要件:\n"
+        "- search_base: 質問の要点を保った短い検索文（日本語、120文字以内）\n"
+        "- vector_queries: ベクトル検索用クエリ配列（1-4件）\n"
+        "- title_queries: タイトル一致検索向け配列（0-4件）\n"
+        "- Wikipedia見出しに合わせて通称・略称を正式名称へ正規化（例: 首相→内閣総理大臣）\n"
+        "- 同義語・正式名称をvector_queries/title_queriesへ最低1件は含める\n"
+        "- 文字数指定や『詳しく』『教えて』などの依頼語は除去\n"
+        "- 固有名詞（人名・地名・組織名）は保持\n"
+        "- 事実を追加しない\n\n"
+        "JSONスキーマ:\n"
+        '{"search_base":"string","vector_queries":["string"],"title_queries":["string"]}\n\n'
+        f"質問: {query}\n"
+    )
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "gemma3:4b",
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    # 質問整形は決定的な短文出力のみ必要なため、最小限パラメータにする
+                    "temperature": 0.0,
+                    "num_predict": _QUERY_NORMALIZATION_NUM_PREDICT,
+                    "num_ctx": 1024,
+                },
+            },
+            timeout=aiohttp.ClientTimeout(total=_QUERY_NORMALIZATION_TIMEOUT_SEC),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+    raw = str(data.get("response", "")).strip()
+    parsed = _parse_json_object_from_text(raw)
+    if not parsed:
+        raise ValueError("Gemma3 query normalization returned non-JSON output")
+
+    search_base_raw = str(parsed.get("search_base", "")).strip()
+    search_base = _normalize_query_term(search_base_raw) or _normalize_query_term(query)
+    search_base = _apply_canonical_replacements(search_base)
+
+    vector_raw = parsed.get("vector_queries")
+    title_raw = parsed.get("title_queries")
+    vector_candidates = vector_raw if isinstance(vector_raw, list) else []
+    title_candidates = title_raw if isinstance(title_raw, list) else []
+
+    vector_queries: list[str] = []
+    vector_seed = _expand_canonical_variants([search_base, *vector_candidates, query])
+    for candidate in vector_seed:
+        if not isinstance(candidate, str):
+            continue
+        term = _normalize_query_term(candidate)
+        if not term:
+            continue
+        if term not in vector_queries:
+            vector_queries.append(term)
+        if len(vector_queries) >= 6:
+            break
+
+    title_queries: list[str] = []
+    title_seed = _expand_canonical_variants([search_base, *title_candidates])
+    for candidate in title_seed:
+        if not isinstance(candidate, str):
+            continue
+        term = _normalize_query_term(candidate)
+        if not term:
+            continue
+        if term in title_queries:
+            continue
+        title_queries.append(term)
+        if len(title_queries) >= 6:
+            break
+
+    if not vector_queries:
+        vector_queries = [search_base]
+
+    return search_base, vector_queries, title_queries
+
+
+async def _extract_search_queries(query: str) -> tuple[str, list[str], list[str]]:
+    """検索クエリ抽出。Gemma3を優先し、失敗時はルールベースへフォールバックする。"""
+    cache_key = " ".join(query.split())
+    cached = _lru_get(_query_extraction_cache, cache_key)
+    if cached is not None:
+        search_base, vector_queries, title_queries = cached
+        # 呼び出し側で配列を書き換えてもキャッシュ汚染しないようコピーして返す
+        return search_base, list(vector_queries), list(title_queries)
+
+    try:
+        extracted = await _extract_search_queries_with_gemma(query)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[_extract_search_queries] fallback to rule-based: {exc}", file=sys.stderr)
+        extracted = _extract_search_queries_rule_based(query)
+
+    _lru_set(_query_extraction_cache, cache_key, extracted, _QUERY_EXTRACTION_CACHE_MAX)
+    return extracted
+
+
 def _merge_ranked_docs(
     primary_vector_docs: list[dict],
     secondary_vector_lists: list[list[dict]],
@@ -704,7 +969,7 @@ async def _retrieve_rag_docs(
     import aiohttp
     import asyncpg
 
-    _, all_vector_queries, all_title_queries = _extract_search_queries(query)
+    _, all_vector_queries, all_title_queries = await _extract_search_queries(query)
     latin_terms = list(dict.fromkeys([token.lower() for token in _RE_LATIN_TOKEN.findall(query)]))
 
     # 速度最適化: 検索クエリ本数を最小化
@@ -781,6 +1046,9 @@ async def _retrieve_rag_docs(
             anchor_terms.append(tq)
 
     async def embed_one(session: "aiohttp.ClientSession", text: str) -> list[float]:
+        cached = _lru_get(_embed_cache, text)
+        if cached is not None:
+            return cached
         async with session.post(
             "http://localhost:11434/api/embed",
             json={"model": "nomic-embed-text", "input": "search_query: " + text},
@@ -788,7 +1056,9 @@ async def _retrieve_rag_docs(
         ) as resp:
             resp.raise_for_status()
             data = await resp.json()
-        return data["embeddings"][0]
+        embedding = data["embeddings"][0]
+        _lru_set(_embed_cache, text, embedding, _EMBED_CACHE_MAX)
+        return embedding
 
     async def search_one(pool: "asyncpg.Pool", emb: list[float]) -> list[dict]:
         emb_str = "[" + ",".join(map(str, emb)) + "]"
@@ -933,8 +1203,9 @@ def _build_rag_prompt(context: str, raw_query: str) -> str:
         "- Wikipedia本文に記載のない人名・日付・数字は一切書かないでください\n"
         "- リストを作成する場合は、Wikipedia本文に明記された項目のみを含めてください\n"
         "- 不明な情報は「Wikipediaに記載がありません」と記してください\n\n"
-        f"Wikipedia Context:\n{context}\n\n"
         f"Question (verbatim):\n{raw_query}\n\n"
+        f"Wikipedia Context:\n{context}\n\n"
+        
         "Answer:"
     )
 
@@ -975,14 +1246,6 @@ async def rag_ask(
             for d in tl:
                 title_matched_ids.add(d["id"])
 
-        def _ctx_len(d: dict) -> int:
-            title = d["title"]
-            if "一覧" in title:
-                return 1200
-            if d["id"] in title_matched_ids:
-                return 1000
-            return 800
-
         # 先頭優先は維持（一致記事・一覧記事を前側へ）
         docs.sort(
             key=lambda d: (
@@ -994,13 +1257,17 @@ async def rag_ask(
         context_parts: list[str] = []
         context_sources: list[tuple[str, str]] = []
         total_ctx_chars = 0
+        source_char_stats: list[tuple[str, int]] = []
         for d in docs:
-            chunk = d["content"][: _ctx_len(d)]
+            # 10件全文投入。全体スライスで文字列コピーしない。
+            chunk = d["content"]
+
             if not chunk:
                 chunk = d["content"][:1]
             context_parts.append(f"【{d['title']}】\n{chunk}")
             context_sources.append((d["title"], chunk))
             total_ctx_chars += len(chunk)
+            source_char_stats.append((d["title"], len(chunk)))
 
         included_docs_count = len(context_sources)
         if included_docs_count != retrieved_docs_count:
@@ -1044,6 +1311,8 @@ async def rag_ask(
             f" eval_time={eval_duration_s:.1f}s",
             file=_sys.stderr,
         )
+        for title, size in source_char_stats:
+            print(f"[rag_ask] source_chars title=【{title}】 chars={size:,}", file=_sys.stderr)
         # 参照元タイトル一覧（Gemma3へ渡した順序）
         sources_list_md = "\n".join([f"- 【{title}】" for title, _ in context_sources])
         # 参照元Wikipedia本文（Gemma3へ実際に渡した本文をそのまま保存）

@@ -37,9 +37,7 @@ export type QuestionResponse =
 const MCP_SERVER_URL = process.env.MCP_SERVER_URL || "http://localhost:3333";
 
 async function withClient<T>(fn: (client: Client) => Promise<T>): Promise<T> {
-  const transport = new StreamableHTTPClientTransport(
-    new URL(`${MCP_SERVER_URL}/mcp`),
-  );
+  const transport = new StreamableHTTPClientTransport(new URL(`${MCP_SERVER_URL}/mcp`));
   const client = new Client({ name: "kb-cli", version: "2.0.0" });
   await client.connect(transport);
   try {
@@ -101,10 +99,7 @@ export async function callMCP(prompt: string): Promise<FileResponse> {
   }
 }
 
-export async function createDoc(
-  title: string,
-  tags: string[] = [],
-): Promise<FileResponse> {
+export async function createDoc(title: string, tags: string[] = []): Promise<FileResponse> {
   try {
     const data = (await callTool("create_doc", { title, tags })) as {
       file: string;
@@ -118,10 +113,7 @@ export async function createDoc(
   }
 }
 
-export async function createWikiDoc(
-  title: string,
-  tags: string[] = [],
-): Promise<FileResponse> {
+export async function createWikiDoc(title: string, tags: string[] = []): Promise<FileResponse> {
   try {
     const data = (await callTool("create_doc_wiki", { title, tags })) as {
       file: string;
@@ -135,10 +127,7 @@ export async function createWikiDoc(
   }
 }
 
-export async function createNewsDoc(
-  title: string,
-  tags: string[] = [],
-): Promise<FileResponse> {
+export async function createNewsDoc(title: string, tags: string[] = []): Promise<FileResponse> {
   try {
     const data = (await callTool("create_news", { title, tags })) as {
       file: string;
@@ -190,10 +179,7 @@ export async function searchAllDocs(query: string): Promise<SearchResponse> {
   }
 }
 
-export async function questionDocs(
-  query: string,
-  question: string,
-): Promise<QuestionResponse> {
+export async function questionDocs(query: string, question: string): Promise<QuestionResponse> {
   try {
     const data = (await callTool("question_docs", { query, question })) as {
       matches: SearchDocResult[];
@@ -208,10 +194,7 @@ export async function questionDocs(
   }
 }
 
-export async function askWikiRag(
-  query: string,
-  tags: string[] = [],
-): Promise<FileResponse> {
+export async function askWikiRag(query: string, tags: string[] = []): Promise<FileResponse> {
   try {
     const data = (await callTool("ask_wiki_rag", { query, tags }, 300_000)) as {
       file: string;
@@ -231,9 +214,7 @@ export async function createWikiRagComparison(
   tags: string[] = [],
 ): Promise<FileResponse> {
   try {
-    const timeoutMs = Number(
-      process.env.KB_COMPARE_WIKI_TIMEOUT_MS || "900000",
-    );
+    const timeoutMs = Number(process.env.KB_COMPARE_WIKI_TIMEOUT_MS || "900000");
     const data = (await callTool(
       "create_wiki_rag_comparison",
       {

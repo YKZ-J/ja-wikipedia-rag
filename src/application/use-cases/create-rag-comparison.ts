@@ -13,12 +13,9 @@ type CreateRagComparisonInput = {
   summarize: (prompt: string) => Promise<string>;
 };
 
-const DEFAULT_IMAGE =
-  "https://ytzmpefdjnd1ueff.public.blob.vercel-storage.com/blog.webp";
+const DEFAULT_IMAGE = "https://ytzmpefdjnd1ueff.public.blob.vercel-storage.com/blog.webp";
 
-function firstNonEmpty(
-  ...values: Array<string | undefined>
-): string | undefined {
+function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
   for (const value of values) {
     if (value?.trim()) {
       return value.trim();
@@ -159,15 +156,11 @@ function createArticleBody(params: {
     "",
     "**検索クエリ（実際に使用）**",
     "",
-    ...(ragQueries.length > 0
-      ? ragQueries.map((item) => `- \`${item}\``)
-      : ["- （取得なし）"]),
+    ...(ragQueries.length > 0 ? ragQueries.map((item) => `- \`${item}\``) : ["- （取得なし）"]),
     "",
     "**参照元 Wikipedia 一覧**",
     "",
-    ...(wikiTitles.length > 0
-      ? wikiTitles.map((item) => `- 【${item}】`)
-      : ["- （取得なし）"]),
+    ...(wikiTitles.length > 0 ? wikiTitles.map((item) => `- 【${item}】`) : ["- （取得なし）"]),
     "",
     "---",
   ];
@@ -249,15 +242,12 @@ export async function createRagComparisonDoc({
     })
   ).filter(Boolean);
 
-  const nonRagAnswer = normalizeWhitespace(
-    await summarize(buildNonRagPrompt(trimmedQuery)),
-  );
+  const nonRagAnswer = normalizeWhitespace(await summarize(buildNonRagPrompt(trimmedQuery)));
 
   const articleSlug = buildComparisonSlug();
   const today = getTokyoDateString();
   const articleTitle =
-    title?.trim() ||
-    `RAGで変わるローカルLLMの出力精度比較検証 (${trimmedQuery})`;
+    title?.trim() || `RAGで変わるローカルLLMの出力精度比較検証 (${trimmedQuery})`;
   const articleSummary =
     "ローカルLLM（Gemma3）にRAGを組み合わせた出力とRAGなし出力を比較する自動生成レポートです。";
   const safeTitle = articleTitle.replace(/"/g, "'");

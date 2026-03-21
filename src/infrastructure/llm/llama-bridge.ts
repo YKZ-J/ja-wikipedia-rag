@@ -19,6 +19,8 @@ type LlmCreateOptions = {
   tags?: string[];
 };
 
+export type SummaryMode = "non_rag_minimal" | "search_summary" | "qa_non_rag" | "news_article";
+
 // ============================================================
 // Python コマンド / スクリプトパス解決
 // ============================================================
@@ -36,6 +38,7 @@ function resolvePythonMcpServer(): string {
 // シングルトン MCP クライアント（Python プロセスを起動して保持）
 // ============================================================
 let _llmClient: Client | null = null;
+let _llmCallQueue: Promise<void> = Promise.resolve();
 
 async function getLlmClient(): Promise<Client> {
   if (_llmClient) return _llmClient;
@@ -53,35 +56,59 @@ async function getLlmClient(): Promise<Client> {
   return client;
 }
 
+function runInLlmQueue<T>(task: () => Promise<T>): Promise<T> {
+  const run = _llmCallQueue.then(task, task);
+  _llmCallQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 // ============================================================
 // ツール呼び出しヘルパー
 // ============================================================
 
-// rag_ask はモデルロード + Ollama 生成で最大 5 分かかる
-const LONG_TIMEOUT_TOOLS = new Set(["rag_ask"]);
+// タイムアウトは処理内容に応じて可変にする。
+// compare-wiki では summarize も長文生成になり得るため長めに設定する。
+const TOOL_TIMEOUT_MS: Record<string, number> = {
+  rag_ask: Number(process.env.KB_RAG_ASK_TIMEOUT_MS || "300000"),
+  summarize: Number(process.env.KB_SUMMARIZE_TIMEOUT_MS || "300000"),
+  generate_doc: Number(process.env.KB_GENERATE_DOC_TIMEOUT_MS || "180000"),
+};
+
+function resolveToolTimeout(name: string): number {
+  const configured = TOOL_TIMEOUT_MS[name];
+  if (Number.isFinite(configured) && configured > 0) {
+    return configured;
+  }
+  return 60_000;
+}
 
 async function callLlmTool(name: string, args: Record<string, unknown>): Promise<string> {
-  const client = await getLlmClient();
-  const timeout = LONG_TIMEOUT_TOOLS.has(name) ? 300_000 : 60_000;
-  const result = (await client.callTool({ name, arguments: args }, undefined, {
-    timeout,
-  })) as CallToolResult;
+  return runInLlmQueue(async () => {
+    const client = await getLlmClient();
+    const timeout = resolveToolTimeout(name);
+    const result = (await client.callTool({ name, arguments: args }, undefined, {
+      timeout,
+    })) as CallToolResult;
 
-  if (result.isError) {
-    const errText =
+    if (result.isError) {
+      const errText =
+        result.content?.[0]?.type === "text"
+          ? (result.content[0] as { type: "text"; text: string }).text
+          : "Unknown LLM error";
+      throw new Error(`[llama-bridge] ${errText}`);
+    }
+
+    const text =
       result.content?.[0]?.type === "text"
         ? (result.content[0] as { type: "text"; text: string }).text
-        : "Unknown LLM error";
-    throw new Error(`[llama-bridge] ${errText}`);
-  }
+        : "";
 
-  const text =
-    result.content?.[0]?.type === "text"
-      ? (result.content[0] as { type: "text"; text: string }).text
-      : "";
-
-  if (!text) throw new Error("[llama-bridge] Python LLM returned empty output");
-  return text;
+    if (!text) throw new Error("[llama-bridge] Python LLM returned empty output");
+    return text;
+  });
 }
 
 // ============================================================
@@ -105,6 +132,10 @@ export async function runPythonLLM(prompt: string, options?: LlmCreateOptions): 
  */
 export async function runPythonSummary(prompt: string): Promise<string> {
   return callLlmTool("summarize", { prompt });
+}
+
+export async function runPythonSummaryWithMode(prompt: string, mode: SummaryMode): Promise<string> {
+  return callLlmTool("summarize", { prompt, mode });
 }
 
 /**
