@@ -13,9 +13,12 @@ type CreateRagComparisonInput = {
   summarize: (prompt: string) => Promise<string>;
 };
 
-const DEFAULT_IMAGE = "https://ytzmpefdjnd1ueff.public.blob.vercel-storage.com/blog.webp";
+const DEFAULT_IMAGE =
+  "https://ytzmpefdjnd1ueff.public.blob.vercel-storage.com/blog.webp";
 
-function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
+function firstNonEmpty(
+  ...values: Array<string | undefined>
+): string | undefined {
   for (const value of values) {
     if (value?.trim()) {
       return value.trim();
@@ -114,16 +117,13 @@ function extractSlugFromMarkdown(markdown: string): string {
 
 function buildNonRagPrompt(query: string): string {
   return `あなたは日本語で正確に説明するアシスタントです。
-以下の質問に対して、RAGや外部コンテキストを参照せず、あなた自身の一般知識のみで回答してください。
+以下の質問に対してあなた自身の一般知識のみで回答してください。
 
 質問:
 ${query}
 
 要件:
-- 3000文字程度
 - 見出しを使って構造化する
-- 推測は断定しない
-- Wikipedia参照や出典一覧は付けない
 - Markdownコードブロックは使わない
 `;
 }
@@ -156,11 +156,15 @@ function createArticleBody(params: {
     "",
     "**検索クエリ（実際に使用）**",
     "",
-    ...(ragQueries.length > 0 ? ragQueries.map((item) => `- \`${item}\``) : ["- （取得なし）"]),
+    ...(ragQueries.length > 0
+      ? ragQueries.map((item) => `- \`${item}\``)
+      : ["- （取得なし）"]),
     "",
     "**参照元 Wikipedia 一覧**",
     "",
-    ...(wikiTitles.length > 0 ? wikiTitles.map((item) => `- 【${item}】`) : ["- （取得なし）"]),
+    ...(wikiTitles.length > 0
+      ? wikiTitles.map((item) => `- 【${item}】`)
+      : ["- （取得なし）"]),
     "",
     "---",
   ];
@@ -181,36 +185,42 @@ function createArticleBody(params: {
 
   return `## はじめに
 
-ローカルLLM（Gemma3）にRAGを組み合わせた記事生成パイプラインを用いて、RAGあり・RAGなしの出力を比較するためのレポートです。
-※LLMで作成した記事の部分は必ずしも事実であるとは限りません。
+ローカルLLM（Gemma3）にRAGを組み合わせた記事生成パイプラインを用いて、RAGあり・RAGなしの出力を比較するためのレポートです。  
+※出力した内容は必ずしも事実であるとは限りません。
 
 ## 仕組み（概要）
 
 今回の記事生成パイプラインは以下のステップで動作します。
 
 1. 入力: CLIからの命令をMCPサーバーが受け取る
-2. 検索: 質問を元にWikipedia RAG検索を実行する
+2. 検索: 質問を元にGemma3が質問を整形し、Wikipedia RAG検索を実行する
 3. 生成: Gemma3でRAGあり回答を生成する
 4. 生成: 同じ質問をRAGなしでGemma3に回答させる
 5. 保存: 比較記事をMarkdownとして保存する
+  
+生成した内容をChatGPTに評価させ、精度の違いを検証します。  
+ChatGPTへの指示は「下記の①と②の文章のファクトチェックをした上で回答精度の比較評価をしてださい」です。  
 
+使用しているwikipediaダンプ: jawiki-latest-pages-articles.xml.bz2 04-Mar-2026 01:54 4592085011
 リポジトリ: https://github.com/YKZ-J/ja-wikipedia-rag
 
-### ChatGPTによる精度比較評価
+## 今回の差分
+
+## ChatGPTによる精度比較評価
 
 
-### ① RAGあり出力（Gemma3 + Wikipedia RAG）
+## ① RAGあり出力（Gemma3 + Wikipedia RAG）
 
 ${toQuotedBlock(ragLines)}
 
-### ② RAGなし出力（Gemma3 単体）
+## ② RAGなし出力（Gemma3 単体）
 
 ${toQuotedBlock(nonRagLines)}
 
 ## 結論
 
 精度が高いのは①（RAGあり）の方です。
-RAGによって最新・多様な情報ソースを参照できるため網羅性と具体性が向上します。
+RAGによって情報ソースを参照できるため正確性と具体性が向上します。
 `;
 }
 
@@ -242,12 +252,15 @@ export async function createRagComparisonDoc({
     })
   ).filter(Boolean);
 
-  const nonRagAnswer = normalizeWhitespace(await summarize(buildNonRagPrompt(trimmedQuery)));
+  const nonRagAnswer = normalizeWhitespace(
+    await summarize(buildNonRagPrompt(trimmedQuery)),
+  );
 
   const articleSlug = buildComparisonSlug();
   const today = getTokyoDateString();
   const articleTitle =
-    title?.trim() || `RAGで変わるローカルLLMの出力精度比較検証 (${trimmedQuery})`;
+    title?.trim() ||
+    `RAGで変わるローカルLLMの出力精度比較検証 (${trimmedQuery})`;
   const articleSummary =
     "ローカルLLM（Gemma3）にRAGを組み合わせた出力とRAGなし出力を比較する自動生成レポートです。";
   const safeTitle = articleTitle.replace(/"/g, "'");

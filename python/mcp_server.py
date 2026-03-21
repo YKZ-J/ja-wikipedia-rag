@@ -142,15 +142,13 @@ _JP_QUERY_CANONICAL_VARIANTS = {
     "総理": ["内閣総理大臣", "総理大臣"],
 }
 
-_QUERY_EXTRACTION_CACHE_MAX = int(os.environ.get("RAG_QUERY_CACHE_MAX", "256"))
 _EMBED_CACHE_MAX = int(os.environ.get("RAG_EMBED_CACHE_MAX", "512"))
 _QUERY_NORMALIZATION_TIMEOUT_SEC = float(
-    os.environ.get("RAG_QUERY_NORMALIZATION_TIMEOUT_SEC", "12")
+    os.environ.get("RAG_QUERY_NORMALIZATION_TIMEOUT_SEC", "25")
 )
 _QUERY_NORMALIZATION_NUM_PREDICT = int(
-    os.environ.get("RAG_QUERY_NORMALIZATION_NUM_PREDICT", "64")
+    os.environ.get("RAG_QUERY_NORMALIZATION_NUM_PREDICT", "192")
 )
-_query_extraction_cache: "OrderedDict[str, tuple[str, list[str], list[str]]]" = OrderedDict()
 _embed_cache: "OrderedDict[str, list[float]]" = OrderedDict()
 
 _LLAMA_PRESETS: dict[str, dict[str, float | int]] = {
@@ -221,9 +219,11 @@ def _build_non_rag_prompt(user_prompt: str) -> str:
     return (
         "あなたは日本語の要約・応答アシスタントです。\n"
         "与えられた指示に対して、簡潔で読みやすい日本語で回答してください。\n"
-        "不要な前置きは省き、要求された内容に直接答えてください。\n\n"
-        f"User Prompt:\n{user_prompt}\n\n"
-        "Answer:"
+        "不要な前置きは省き、要求された内容に直接答えてください。\n"
+        "出力言語は日本語のみです（固有名詞を除き英語の文は禁止）。\n"
+        "逆質問はしないでください。\n\n"
+        f"質問：\n{user_prompt}\n\n"
+        "回答：\n"
     )
 
 
@@ -811,45 +811,61 @@ async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]
 
     prompt = (
         "あなたはWikipedia検索用のクエリ整形アシスタントです。\n"
-        "ユーザー質問を、意味を変えずに検索しやすい形へ整形してください。\n"
-        "出力は必ずJSONオブジェクトのみで返してください。説明文は禁止です。\n\n"
+        "ユーザー質問(下記の今回のWikipedia検索用のクエリ整形対象の質問:の部分)を、意味を変えずに検索しやすい形へ整形してください。\n"
+        "出力は必ずJSONオブジェクトのみで返してください。\n\n"
         "要件:\n"
         "- search_base: 質問の要点を保った短い検索文（日本語、120文字以内）\n"
-        "- vector_queries: ベクトル検索用クエリ配列（1-4件）\n"
-        "- title_queries: タイトル一致検索向け配列（0-4件）\n"
-        "- Wikipedia見出しに合わせて通称・略称を正式名称へ正規化（例: 首相→内閣総理大臣）\n"
-        "- 同義語・正式名称をvector_queries/title_queriesへ最低1件は含める\n"
-        "- 文字数指定や『詳しく』『教えて』などの依頼語は除去\n"
-        "- 固有名詞（人名・地名・組織名）は保持\n"
-        "- 事実を追加しない\n\n"
+        "- vector_queries: ベクトル検索用クエリ配列\n"
+        "- title_queries: タイトル一致検索向け配列\n"
+        "- vector_queries/title_queriesに質問に含まれる固有名詞と、その同義語・正式名称をできるだけ入れる。通称・略称は正式名称へ正規化したものも入れる（例: 首相→内閣総理大臣）\n"
+        "- 文字数指定や『詳しく』『教えて』などの依頼語は除去する\n"
         "JSONスキーマ:\n"
         '{"search_base":"string","vector_queries":["string"],"title_queries":["string"]}\n\n'
-        f"質問: {query}\n"
+        f"今回のWikipedia検索用のクエリ整形対象の質問: {query}\n"
     )
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "gemma3:4b",
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    # 質問整形は決定的な短文出力のみ必要なため、最小限パラメータにする
-                    "temperature": 0.0,
-                    "num_predict": _QUERY_NORMALIZATION_NUM_PREDICT,
-                    "num_ctx": 1024,
+    async def call_normalizer(num_predict: int) -> tuple[str, str]:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": "gemma3:4b",
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        # 質問整形は決定的な短文出力のみ必要なため、低温度を維持
+                        "temperature": 0.0,
+                        "num_predict": num_predict,
+                        "num_ctx": 1024,
+                    },
                 },
-            },
-            timeout=aiohttp.ClientTimeout(total=_QUERY_NORMALIZATION_TIMEOUT_SEC),
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
+                timeout=aiohttp.ClientTimeout(total=_QUERY_NORMALIZATION_TIMEOUT_SEC),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        raw_text = str(data.get("response", "")).strip()
+        done_reason = str(data.get("done_reason", ""))
+        return raw_text, done_reason
 
-    raw = str(data.get("response", "")).strip()
+    raw, done_reason = await call_normalizer(_QUERY_NORMALIZATION_NUM_PREDICT)
     parsed = _parse_json_object_from_text(raw)
+    if not parsed and done_reason == "length":
+        # 生成打ち切り時のみ1回だけ拡張リトライする
+        retry_num_predict = max(_QUERY_NORMALIZATION_NUM_PREDICT * 2, 256)
+        print(
+            f"[_extract_search_queries_with_gemma] retry due to truncated output: "
+            f"done_reason={done_reason} num_predict={_QUERY_NORMALIZATION_NUM_PREDICT} -> {retry_num_predict}",
+            file=sys.stderr,
+        )
+        raw, done_reason = await call_normalizer(retry_num_predict)
+        parsed = _parse_json_object_from_text(raw)
+
     if not parsed:
-        raise ValueError("Gemma3 query normalization returned non-JSON output")
+        preview = raw[:220].replace("\n", "\\n")
+        raise ValueError(
+            "Gemma3 query normalization returned non-JSON output "
+            f"(done_reason={done_reason}, preview={preview!r})"
+        )
 
     search_base_raw = str(parsed.get("search_base", "")).strip()
     search_base = _normalize_query_term(search_base_raw) or _normalize_query_term(query)
@@ -893,23 +909,17 @@ async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]
     return search_base, vector_queries, title_queries
 
 
-async def _extract_search_queries(query: str) -> tuple[str, list[str], list[str]]:
+async def _extract_search_queries(query: str) -> tuple[str, list[str], list[str], str]:
     """検索クエリ抽出。Gemma3を優先し、失敗時はルールベースへフォールバックする。"""
-    cache_key = " ".join(query.split())
-    cached = _lru_get(_query_extraction_cache, cache_key)
-    if cached is not None:
-        search_base, vector_queries, title_queries = cached
-        # 呼び出し側で配列を書き換えてもキャッシュ汚染しないようコピーして返す
-        return search_base, list(vector_queries), list(title_queries)
-
     try:
         extracted = await _extract_search_queries_with_gemma(query)
+        print("[_extract_search_queries] mode=gemma_json", file=sys.stderr)
+        return extracted[0], extracted[1], extracted[2], "gemma_json"
     except Exception as exc:  # noqa: BLE001
         print(f"[_extract_search_queries] fallback to rule-based: {exc}", file=sys.stderr)
         extracted = _extract_search_queries_rule_based(query)
-
-    _lru_set(_query_extraction_cache, cache_key, extracted, _QUERY_EXTRACTION_CACHE_MAX)
-    return extracted
+        print("[_extract_search_queries] mode=rule_based_fallback", file=sys.stderr)
+        return extracted[0], extracted[1], extracted[2], "rule_based_fallback"
 
 
 def _merge_ranked_docs(
@@ -964,12 +974,12 @@ def _merge_ranked_docs(
 async def _retrieve_rag_docs(
     query: str,
     db_url: str,
-) -> tuple[list[dict], list[str], list[list[dict]]]:
+) -> tuple[list[dict], list[str], list[list[dict]], str]:
     """RAG 用の検索を実行し、統合済み候補を返す。"""
     import aiohttp
     import asyncpg
 
-    _, all_vector_queries, all_title_queries = await _extract_search_queries(query)
+    _, all_vector_queries, all_title_queries, extraction_mode = await _extract_search_queries(query)
     latin_terms = list(dict.fromkeys([token.lower() for token in _RE_LATIN_TOKEN.findall(query)]))
 
     # 速度最適化: 検索クエリ本数を最小化
@@ -1186,28 +1196,64 @@ async def _retrieve_rag_docs(
             if filtered_docs:
                 docs = filtered_docs
 
-    # Gemma3 入力は最大 10 件（高精度優先で不足時は件数を減らす）
-    return docs[:10], vector_queries, title_lists
+    # Gemma3 入力は最大 3 件（ランキング上位を優先）
+    return docs[:3], vector_queries, title_lists, extraction_mode
 
 
-def _build_rag_prompt(context: str, raw_query: str) -> str:
-    """Gemma3 へ渡す RAG プロンプトを構築する。
-
-    raw_query はユーザー入力を一切加工せず、そのまま質問欄へ入れる。
-    """
-    return (
-        "あなたは日本語のWikipedia情報を正確に要約するアシスタントです。\n"
-        "以下のWikipedia本文のみを根拠として、質問に答えてください。\n"
-        "【重要なルール】\n"
-        "- 提供されたWikipedia本文に書かれている事実のみを使用してください\n"
-        "- Wikipedia本文に記載のない人名・日付・数字は一切書かないでください\n"
-        "- リストを作成する場合は、Wikipedia本文に明記された項目のみを含めてください\n"
-        "- 不明な情報は「Wikipediaに記載がありません」と記してください\n\n"
-        f"Question (verbatim):\n{raw_query}\n\n"
-        f"Wikipedia Context:\n{context}\n\n"
-        
-        "Answer:"
+def _build_rag_messages(context: str, user_prompt: str) -> list[dict[str, str]]:
+    """Gemma3 chat API 用の system/user/assistant(先行注入) メッセージを構築する。"""
+    system_msg = (
+        "あなたは日本語の解説ライターです。"
+        "ユーザーの質問に対して、提供された参照資料の情報を十分に活用し、"
+        "詳しく読みやすい日本語の解説文を作成してください。\n"
+        "ルール:\n"
+        "- 出力は解説本文のみ。採点・講評・称賛・批評・メタコメントは一切禁止。\n"
+        "- 出力言語は日本語のみ（固有名詞を除き英語文禁止）。\n"
+        "- 参照資料の情報を最大限引用・活用して回答すること。資料に豊富な情報がある場合は省略せず詳細に記述。\n"
+        "- 文字数指定がある場合は必ずその文字数を目安に記述すること。沿革・組織・特色・研究など複数の観点から網羅的に解説。\n"
+        "- 箇条書き中心ではなく、段落形式の説明文で記述。\n"
+        "- 逆質問や前置きは不要。\n"
+        "- 参照資料に含まれない事実を創作しないこと。"
     )
+    # コンテキストを先に配置し、質問を末尾に置く。
+    # 質問が生成開始位置に近いほど Gemma3:4b の注意が質問に向きやすい。
+    user_msg = (
+        f"以下は参照資料です。\n\n"
+        f"{context}\n\n"
+        f"上記の参照資料の情報を十分に使い、次の質問に詳しく回答してください。\n\n"
+        f"質問: {user_prompt}"
+    )
+    # 質問から主題を抽出して assistant prefill を生成する。
+    # 解説文の書き出しを先行注入することで、モデルを「解説文の続きを書く」モードに固定し、
+    # 講評・採点モードへの遷移を構造的に防ぐ。
+    subject = _extract_subject(user_prompt)
+    assistant_prefill = f"{subject}は、"
+    return [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+        {"role": "assistant", "content": assistant_prefill},
+    ]
+
+
+def _extract_subject(prompt: str) -> str:
+    """質問文から主題語を抽出する。「～について」「～とは」「～を」などのパターンに対応。"""
+    import re as _re_mod
+    # 「～について」パターン
+    m = _re_mod.search(r"^(.+?)について", prompt)
+    if m:
+        return m.group(1).strip()
+    # 「～とは」パターン
+    m = _re_mod.search(r"^(.+?)とは", prompt)
+    if m:
+        return m.group(1).strip()
+    # 「～を」パターン
+    m = _re_mod.search(r"^(.+?)を", prompt)
+    if m:
+        return m.group(1).strip()
+    # フォールバック: 最初の20文字
+    return prompt[:20].rstrip("。、 ")
+
+
 
 
 @mcp.tool()
@@ -1226,9 +1272,9 @@ async def rag_ask(
     """
     import aiohttp
 
-    raw_query = query
     db_url: str = get_db_url()
-    docs, sub_queries, title_lists = await _retrieve_rag_docs(raw_query, db_url)
+    docs, sub_queries, title_lists, extraction_mode = await _retrieve_rag_docs(query, db_url)
+    print(f"[rag_ask] query_extraction_mode={extraction_mode}", file=sys.stderr)
 
     # --- Ollama Gemma3 で回答生成（非同期） ---
     if not docs:
@@ -1236,8 +1282,8 @@ async def rag_ask(
         sources_list_md = ""
         sources_body_md = ""
     else:
-        # 取得した Wikipedia は 10 件固定で、全件を Gemma3 入力へ含める
-        TARGET_DOCS_FOR_GEMMA = 10
+        # 取得した Wikipedia は上位 2 件のみ Gemma3 入力へ含める
+        TARGET_DOCS_FOR_GEMMA = 2
         docs = docs[:TARGET_DOCS_FOR_GEMMA]
         retrieved_docs_count = len(docs)
 
@@ -1254,56 +1300,131 @@ async def rag_ask(
             )
         )
 
-        context_parts: list[str] = []
-        context_sources: list[tuple[str, str]] = []
-        total_ctx_chars = 0
-        source_char_stats: list[tuple[str, int]] = []
-        for d in docs:
-            # 10件全文投入。全体スライスで文字列コピーしない。
-            chunk = d["content"]
+        # 入力コンテキストを安全側で制限する。
+        # さらにAPI側で context overflow が発生した場合は、本文を段階的に縮小して再試行する。
+        MAX_CONTEXT_CHARS = int(os.environ.get("RAG_MAX_CONTEXT_CHARS", "14000"))
+        MIN_CONTEXT_CHARS = int(os.environ.get("RAG_MIN_CONTEXT_CHARS", "1200"))
 
+        base_sources: list[tuple[str, str]] = []
+        for d in docs:
+            chunk = d["content"]
             if not chunk:
                 chunk = d["content"][:1]
-            context_parts.append(f"【{d['title']}】\n{chunk}")
-            context_sources.append((d["title"], chunk))
-            total_ctx_chars += len(chunk)
-            source_char_stats.append((d["title"], len(chunk)))
+            base_sources.append((d["title"], chunk))
+
+        def build_context_sources(char_limit: int) -> list[tuple[str, str]]:
+            built: list[tuple[str, str]] = []
+            used = 0
+            for title, body in base_sources:
+                remaining = char_limit - used
+                if remaining <= 0:
+                    break
+                piece = body[:remaining]
+                if not piece:
+                    continue
+                built.append((title, piece))
+                used += len(piece)
+            if not built and base_sources:
+                title, body = base_sources[0]
+                built.append((title, body[: max(1, MIN_CONTEXT_CHARS)]))
+            return built
+
+        import sys as _sys
+
+        current_limit = MAX_CONTEXT_CHARS
+        context_sources = build_context_sources(current_limit)
+        source_char_stats: list[tuple[str, int]] = []
+        total_ctx_chars = 0
+        gen_data: dict | None = None
+        prefill = ""
+
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(3):
+                context_parts = [f"【{title}】\n{body}" for title, body in context_sources]
+                source_char_stats = [(title, len(body)) for title, body in context_sources]
+                total_ctx_chars = sum(size for _, size in source_char_stats)
+
+                context = "\n\n".join(context_parts)
+                rag_messages = _build_rag_messages(context, query)
+
+                # 質問原文が user メッセージに含まれていることを検証
+                user_content = rag_messages[1]["content"]
+                if query not in user_content:
+                    raise RuntimeError(
+                        "RAG prompt integrity check failed: original query is not embedded verbatim in user message"
+                    )
+
+                # assistant prefill の先頭をログ
+                prefill = rag_messages[2]["content"]
+                print(
+                    "[rag_ask] prompt_check"
+                    f" query_in_user_msg=True"
+                    f" assistant_prefill={prefill!r}"
+                    f" query_preview={query[:80]!r}",
+                    file=_sys.stderr,
+                )
+
+                try:
+                    async with session.post(
+                        "http://localhost:11434/api/chat",
+                        json={
+                            "model": "gemma3:4b",
+                            "messages": rag_messages,
+                            "stream": False,
+                            "options": {
+                                "num_ctx": 20000,
+                                "num_predict": 2000,
+                                "temperature": 0.08,
+                                "top_k": 15,
+                                "top_p": 0.85,
+                                "repeat_penalty": 1.03,
+                            },
+                        },
+                        timeout=aiohttp.ClientTimeout(total=300),
+                    ) as resp:
+                        if resp.status >= 400:
+                            err_text = await resp.text()
+                            raise RuntimeError(
+                                f"Ollama chat failed: status={resp.status} body={err_text[:400]}"
+                            )
+                        gen_data = await resp.json()
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    error_text = str(exc).lower()
+                    likely_context_overflow = (
+                        "context" in error_text
+                        or "token" in error_text
+                        or "n_ctx" in error_text
+                        or "length" in error_text
+                    )
+                    can_shrink_more = current_limit > MIN_CONTEXT_CHARS
+                    is_last_attempt = attempt >= 2
+                    if not likely_context_overflow or not can_shrink_more or is_last_attempt:
+                        raise
+
+                    next_limit = max(int(current_limit * 0.7), MIN_CONTEXT_CHARS)
+                    print(
+                        "[rag_ask] context_shrink_retry"
+                        f" attempt={attempt + 1}"
+                        f" char_limit={current_limit} -> {next_limit}"
+                        f" reason={exc}",
+                        file=_sys.stderr,
+                    )
+                    current_limit = next_limit
+                    context_sources = build_context_sources(current_limit)
+
+        if gen_data is None:
+            raise RuntimeError("Ollama chat response is empty")
 
         included_docs_count = len(context_sources)
-        if included_docs_count != retrieved_docs_count:
-            raise RuntimeError(
-                f"Context build mismatch: retrieved={retrieved_docs_count}, included={included_docs_count}"
-            )
+        answer = gen_data.get("message", {}).get("content", "").strip()
+        # assistant prefill + 生成結果を結合して完全な回答にする
+        answer = prefill + answer
 
-        context = "\n\n".join(context_parts)
-        rag_prompt = _build_rag_prompt(context, raw_query)
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": "gemma3:4b",
-                    "prompt": rag_prompt,
-                    "stream": False,
-                    "options": {
-                        # 速度最適化: 10件入力は維持しつつ、出力長と探索幅をさらに圧縮
-                        "num_ctx": 30000,
-                        "num_predict": 10000,
-                        "temperature": 0.15,
-                        "top_k": 15,
-                        "top_p": 0.85,
-                        "repeat_penalty": 1.03,
-                    },
-                },
-                timeout=aiohttp.ClientTimeout(total=300),
-            ) as resp:
-                resp.raise_for_status()
-                gen_data = await resp.json()
-        answer = gen_data["response"].strip()
         # 実際のトークン使用量をログ（チューニング用）
         prompt_eval_count = gen_data.get("prompt_eval_count", "?")
         eval_count = gen_data.get("eval_count", "?")
         eval_duration_s = gen_data.get("eval_duration", 0) / 1e9
-        import sys as _sys
         print(
             f"[rag_ask] context={total_ctx_chars:,}文字"
             f" retrieved_docs={retrieved_docs_count} included_docs={included_docs_count}"
@@ -1329,13 +1450,13 @@ async def rag_ask(
     now = datetime.now(ZoneInfo("Asia/Tokyo"))
     today = now.strftime("%Y-%m-%d")
     doc_id = now.strftime("%Y%m%d%H%M%S")
-    slug = generate_slug(raw_query, out_dir)
+    slug = generate_slug(query, out_dir)
     summary = trim_summary(normalize_summary(answer)) or "Wikipedia RAG による回答"
 
     metadata_lines = [
         "---",
         f'id: "{doc_id}"',
-        f'title: "{raw_query}"',
+        f'title: "{query}"',
         f'slug: "{slug}"',
         f"tags: [{tags_field}]",
         f'created: "{today}"',
@@ -1349,8 +1470,9 @@ async def rag_ask(
     ]
 
     body = (
-        f"# 質問\n{raw_query}\n\n"
+        f"# 質問\n{query}\n\n"
         f"# 回答\n{answer}\n\n"
+        f"# 検索クエリ抽出モード\n{extraction_mode}\n\n"
         f"# 検索クエリ (実際に使用)\n"
         + "\n".join([f"- `{sq}`" for sq in sub_queries])
         + "\n\n"

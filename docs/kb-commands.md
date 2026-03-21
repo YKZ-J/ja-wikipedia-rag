@@ -104,7 +104,7 @@ kb create-news "TypeScript 最新動向" typescript news
 
 ```bash
 kb ask-wiki "富士山の標高は？"
-kb ask-wiki "北海道の観光名と春のイベントを1500文字程度で詳しく解説して"
+kb ask-wiki "北海道の観光名所と春のイベントを1500文字程度で詳しく解説して"
 kb ask-wiki "アイヌ民族の歴史と文化について" wikipedia history
 ```
 
