@@ -9,6 +9,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 import { createNewsArticle } from "../../application/use-cases/create-news";
+import { createRagComparisonDoc } from "../../application/use-cases/create-rag-comparison";
 import { createDocFromWikipedia } from "../../application/use-cases/create-wiki-doc";
 import { searchAllDocs, searchDocs } from "../../application/use-cases/search-docs";
 import {
@@ -218,6 +219,33 @@ function createMcpServer(): McpServer {
       console.log(`[MCP] ask_wiki_rag: "${query}"`);
       const filePath = await runPythonRAGDoc(query, tags);
       console.log(`[MCP] Generated: ${filePath}`);
+      return jsonText({ file: filePath });
+    },
+  );
+
+  server.registerTool(
+    "create_wiki_rag_comparison",
+    {
+      title: "Wikipedia RAG比較記事生成",
+      description:
+        "RAGあり/なしの回答比較記事をテンプレートで生成し、参照元Wikipediaのslugをsourcesへ自動設定する",
+      inputSchema: {
+        query: z.string().min(1).describe("比較に使う質問文"),
+        title: z.string().optional().describe("比較記事のタイトル"),
+        tags: z.array(z.string()).optional().describe("タグリスト"),
+      },
+    },
+    async ({ query, title, tags = [] }) => {
+      console.log(`[MCP] create_wiki_rag_comparison: "${query}"`);
+      const filePath = await createRagComparisonDoc({
+        query,
+        title,
+        tags,
+        createRagDoc: runPythonRAGDoc,
+        createWikiDoc: (keyword, wikiTags) => createDocFromWikipedia({ keyword, tags: wikiTags }),
+        summarize: runPythonSummary,
+      });
+      console.log(`[MCP] Generated comparison: ${filePath}`);
       return jsonText({ file: filePath });
     },
   );

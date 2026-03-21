@@ -12,6 +12,7 @@ import {
   createDoc,
   createNewsDoc,
   createWikiDoc,
+  createWikiRagComparison,
   questionDocs,
   searchAllDocs,
   searchDocs,
@@ -23,6 +24,7 @@ Usage:
   kb create "<title>" [tags...]
   kb create-wiki "<title>" [tags...]
   kb create-news "<title>" [tags...]
+  kb compare-wiki "<query>" [--title "<title>"] [tags...]
   kb search "<query>"
   kb search-all "<query>"
   kb question "<query>" "<question>"
@@ -36,6 +38,7 @@ Examples:
   kb create-wiki "TypeScript" typescript language
   kb create-news "TypeScript 最新動向" typescript news
   kb ask-wiki "富士山の標高は？"
+  kb compare-wiki "アイヌ民族について教えて。世界の少数民族との共通点も教えて。3000文字程度でできるだけ詳しく" --title "RAGで変わるローカルLLMの出力精度比較検証" rag llm
   kb ask-wiki "東京の人口" wikipedia qa
   kb search "Next.js"
   kb search-all "Next.js パフォーマンス"
@@ -238,6 +241,35 @@ async function runAskWiki(args: string[]): Promise<void> {
   printFileResult(result);
 }
 
+async function runCompareWiki(args: string[]): Promise<void> {
+  const query = args[0] || "";
+  if (!query) {
+    console.error("✗ Error: query required");
+    process.exit(1);
+  }
+
+  let title: string | undefined;
+  const rest = args.slice(1);
+  const titleFlagIndex = rest.indexOf("--title");
+
+  if (titleFlagIndex >= 0) {
+    title = rest[titleFlagIndex + 1] || undefined;
+    if (!title) {
+      console.error("✗ Error: --title requires a value");
+      process.exit(1);
+    }
+  }
+
+  const tags =
+    titleFlagIndex >= 0
+      ? rest.filter((_, index) => index !== titleFlagIndex && index !== titleFlagIndex + 1)
+      : rest;
+
+  console.log(`[KB CLI] Compare Wikipedia RAG: "${query}"`);
+  const result = await createWikiRagComparison(query, title, tags);
+  printFileResult(result);
+}
+
 async function runDefault(args: string[]): Promise<void> {
   console.log("[KB CLI] Generating document...");
   const result = await callMCP(args.join(" "));
@@ -263,6 +295,8 @@ const COMMAND_HANDLERS: Record<string, () => Promise<void>> = {
   "create-wiki": () => runCreateWiki(rest),
   "create-news": () => runCreateNews(rest),
   "ask-wiki": () => runAskWiki(rest),
+  "aski-wiki": () => runAskWiki(rest),
+  "compare-wiki": () => runCompareWiki(rest),
 };
 
 const handler = command in COMMAND_HANDLERS ? COMMAND_HANDLERS[command] : () => runDefault(rawArgs);

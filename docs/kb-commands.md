@@ -97,6 +97,57 @@ kb ask-wiki "アイヌ民族の歴史と文化について" wikipedia history
 
 ---
 
+### `kb compare-wiki "<質問>" [--title "<比較記事タイトル>"] [タグ...]` — RAGあり/なしの比較記事生成
+
+`compare-wiki` は以下の流れで比較記事（Markdown）を自動生成します。
+
+1. `ask-wiki` 相当の Wikipedia RAG 回答を生成（最大10件の参照を利用）
+2. RAGあり出力の回答本文・使用した検索クエリ・参照元 Wikipedia タイトル一覧を抽出
+3. 抽出した参照元タイトルごとに `kb create-wiki` を実行して個別の Wikipedia ソース記事（slug）を作成
+4. 同じ質問を RAG なしで LLM に投げて比較用の出力を取得
+5. 比較記事の frontmatter に `sources` として作成した slug を埋め、RAGあり／RAGなしの出力を両方含む Markdown を Vault に保存
+
+オプション:
+
+- `--title "<比較記事タイトル>"` : 生成する比較記事のタイトルを明示的に指定（省略時は自動タイトル）
+- `タグ...` : 比較記事に付与するタグ（省略可）
+
+例:
+
+```bash
+kb compare-wiki "アイヌ民族について教えて。世界の少数民族との共通点も教えて。3000文字程度でできるだけ詳しく" --title "RAGで変わるローカルLLMの出力精度比較検証" rag llm
+
+# シンプル実行（タイトル省略、タグなし）
+kb compare-wiki "東京都の観光名と歴史を1500文字で説明して"
+```
+
+生成される比較記事の frontmatter 例（`sources` に `create-wiki` で生成した slug が入る）:
+
+```yaml
+---
+title: "RAGで変わるローカルLLMの出力精度比較検証"
+slug: "a1b2-rag-local-llm-comparison"
+tags:
+  - ai
+  - rag
+  - llm
+sources:
+  - 3f4a-wikipedia-source
+  - 7c2d-wikipedia-source
+created: 2026-03-21
+updated: 2026-03-21
+summary: "RAGあり/なしの出力を比較した自動生成レポート"
+image: "https://.../blog.webp"
+type: tech
+isDraft: "false"
+---
+```
+
+注意:
+
+- `compare-wiki` は内部で複数の外部API呼び出し／LLM処理を行うため実行に時間がかかる場合があります。MCP サーバーが稼働中であることを確認してください。
+- Vault 出力先は `VAULT_PATH` を参照します（環境変数が未設定だとエラーになります）。
+
 ### `kb search "<クエリ>"` — Vault 検索
 
 Vault 内のドキュメントをフルテキスト検索し、LLM 要約付きで結果を返す。

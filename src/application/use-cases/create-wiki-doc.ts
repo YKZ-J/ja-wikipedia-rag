@@ -4,7 +4,10 @@ import { getTokyoDateString } from "../../shared/lib/date";
 import { normalizeWhitespace } from "../../shared/lib/text";
 import { randomToken4 } from "../../shared/lib/token";
 
-const OUTPUT_DIR = process.env.KB_BLOG_SOURCE_PATH ?? "";
+const OUTPUT_DIR =
+  process.env.KB_BLOG_SOURCE_PATH?.trim() ||
+  process.env.VAULT_PATH?.trim() ||
+  path.resolve(process.cwd(), "vault/docs/notes");
 
 type CreateFromWikipediaInput = {
   keyword: string;
