@@ -28,6 +28,7 @@ kb <command> "<引数>" [タグ...]
 | `kb search-all`     | `search_all_docs` → Python `summarize(mode="search_summary")`                     | 検索結果上位を要約する固定テンプレート                                                                                                  | preset `search_summary`: `max_tokens=700`, `temperature=0.2`, `top_k=20`, `repeat_penalty=1.05`                                                                                         |
 | `kb question`       | `question_docs` → `buildQuestionPrompt()` → Python `summarize(mode="qa_non_rag")` | 関連ドキュメント抜粋 + 質問を埋め込むテンプレート                                                                                       | preset `qa_non_rag`: `max_tokens=2600`, `temperature=0.5`, `top_k=40`, `repeat_penalty=1.08`                                                                                            |
 | `kb ask-wiki`       | `ask_wiki_rag` → Python `rag_ask`                                                 | 2段階: 1) 質問整形Prompt 2) RAG回答Prompt (`_build_rag_prompt`)                                                                         | 1) 質問整形(Ollama): `temperature=0.0`, `num_predict=128` 2) RAG回答(Ollama): `num_ctx=30000`, `num_predict=10000`, `temperature=0.15`, `top_k=15`, `top_p=0.85`, `repeat_penalty=1.03` |
+| `kb arange-blog`    | `arange_blog` → `src/application/use-cases/arange-blog.ts`                        | 指定記事の所定3箇所へ外部Markdownを引用（行頭`>`）で挿入するユーティリティ                                                              | なし                                                                                                                                                                                    |
 | `kb compare-wiki`   | `create_wiki_rag_comparison`                                                      | **RAGあり**: `ask-wiki` と同一。**RAGなし**: `buildNonRagPrompt()`（一般知識のみで回答）を Python `summarize(mode="qa_non_rag")` へ入力 | **RAGあり**: `ask-wiki` と同一（質問整形 + RAG回答）。**RAGなし**: preset `qa_non_rag`: `max_tokens=2600`, `temperature=0.5`, `top_k=40`, `repeat_penalty=1.08`                         |
 
 補足:
@@ -164,10 +165,30 @@ isDraft: "false"
 ---
 ```
 
+追記: `compare-wiki` の RAGあり出力では、内部で使用した抽出モード（`gemma_json` または `rule_based_fallback`）が生成ファイルに `extraction_mode` として記録されます。さらに、RAG検索で取得した上位10件のランキング（タイトル・ソースslug・スコア/類似度）を `ranked_sources` セクションとしてフロントマターまたは本文内に出力します。これにより、どの抽出モードでどの候補が選ばれたか、順位とスコアを明示的に確認できます。
+
 注意:
 
 - `compare-wiki` は内部で複数の外部API呼び出し／LLM処理を行うため実行に時間がかかる場合があります。MCP サーバーが稼働中であることを確認してください。
 - Vault 出力先は `VAULT_PATH` を参照します（環境変数が未設定だとエラーになります）。
+
+### `kb arange-blog "<slug or filename>"` — 既存記事へ外部Markdownを引用挿入
+
+指定した記事の所定の3箇所に、外部Markdownソースを行頭 `>` の引用形式で挿入します（実装済み）。通常は対象記事の `sources` フロントマターを参照して外部ファイルを解決し、見出し箇所を探索して挿入を行います。
+
+例:
+
+```bash
+kb arange-blog "a1b2-rag-local-llm-comparison"
+```
+
+出力例:
+
+```
+✓ Updated: /path/to/vault/a1b2-rag-local-llm-comparison.md
+```
+
+注意: 挿入対象の構造（見出し名/パス）が想定と異なる場合は手動調整が必要になることがあります。
 
 ### `kb search "<クエリ>"` — Vault 検索
 

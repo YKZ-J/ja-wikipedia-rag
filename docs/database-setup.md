@@ -46,11 +46,12 @@ service_role key: eyJ...
 
 ```bash
 # .env.local を作成（.gitignore に追加済み）
+# DATABASE_URL のパスワードは上記 supabase start 出力の DB URL で確認してください
 cat > .env.local << 'EOF'
 SUPABASE_URL=http://localhost:54324
 SUPABASE_ANON_KEY=<上記 anon key>
 SUPABASE_SERVICE_ROLE_KEY=<上記 service_role key>
-DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54325/postgres
+DATABASE_URL=postgresql://postgres:<上記 DB URL のパスワード>@127.0.0.1:54325/postgres
 EOF
 
 source .env.local

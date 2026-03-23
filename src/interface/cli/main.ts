@@ -5,6 +5,7 @@
  * ローカル LLM で知識ベース管理
  */
 
+import { arangeBlogDocument } from "../../application/use-cases/arange-blog";
 import type { FileResponse, QuestionResponse, SearchResponse } from "../http/mcp-client";
 import {
   askWikiRag,
@@ -24,6 +25,7 @@ Usage:
   kb create "<title>" [tags...]
   kb create-wiki "<title>" [tags...]
   kb create-news "<title>" [tags...]
+  kb arange-blog "<file-name>"
   kb compare-wiki "<query>" [--title "<title>"] [tags...]
   kb search "<query>"
   kb search-all "<query>"
@@ -37,6 +39,7 @@ Examples:
   kb create "Next.js 16 最新機能" nextjs web
   kb create-wiki "TypeScript" typescript language
   kb create-news "TypeScript 最新動向" typescript news
+  kb arange-blog "5hz2-rag-local-llm-comparison"
   kb ask-wiki "富士山の標高は？"
   kb compare-wiki "アイヌ民族について教えて。世界の少数民族との共通点も教えて。3000文字程度でできるだけ詳しく" --title "RAGで変わるローカルLLMの出力精度比較検証" rag llm
   kb ask-wiki "東京の人口" wikipedia qa
@@ -270,6 +273,18 @@ async function runCompareWiki(args: string[]): Promise<void> {
   printFileResult(result);
 }
 
+async function runArangeBlog(args: string[]): Promise<void> {
+  const fileName = args[0] || "";
+  if (!fileName) {
+    console.error("✗ Error: file name required");
+    process.exit(1);
+  }
+
+  console.log(`[KB CLI] Arrange blog sections: "${fileName}"`);
+  const outputPath = await arangeBlogDocument(fileName);
+  console.log(`✓ Updated: ${outputPath}`);
+}
+
 async function runDefault(args: string[]): Promise<void> {
   console.log("[KB CLI] Generating document...");
   const result = await callMCP(args.join(" "));
@@ -294,6 +309,7 @@ const COMMAND_HANDLERS: Record<string, () => Promise<void>> = {
   create: () => runCreate(rest),
   "create-wiki": () => runCreateWiki(rest),
   "create-news": () => runCreateNews(rest),
+  "arange-blog": () => runArangeBlog(rest),
   "ask-wiki": () => runAskWiki(rest),
   "aski-wiki": () => runAskWiki(rest),
   "compare-wiki": () => runCompareWiki(rest),

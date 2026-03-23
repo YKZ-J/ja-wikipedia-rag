@@ -101,7 +101,7 @@ VAULT_PATH=/path/to/vault/docs
 SUPABASE_URL=http://localhost:54324
 SUPABASE_ANON_KEY=<anon-key>
 SUPABASE_SERVICE_ROLE_KEY=<service-role-key>
-DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54325/postgres
+DATABASE_URL=postgresql://postgres:<db-password>@127.0.0.1:54325/postgres
 
 # RAG チューニング（任意）
 RAG_DB_MAX_CONCURRENCY=4

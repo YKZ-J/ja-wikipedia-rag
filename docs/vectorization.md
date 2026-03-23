@@ -55,7 +55,7 @@ pip install -r requirements.txt
 # .env.local
 SUPABASE_URL=http://127.0.0.1:54321
 SUPABASE_SERVICE_ROLE_KEY=<supabase start で表示される service_role key>
-DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54322/postgres
+DATABASE_URL=postgresql://postgres:<supabase start で表示される DB パスワード>@127.0.0.1:54322/postgres
 ```
 
 ---

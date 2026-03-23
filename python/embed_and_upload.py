@@ -345,7 +345,12 @@ async def process_file(
 
     if _own_session or _own_client:
         connector = aiohttp.TCPConnector(limit=HTTP_CONNECTION_LIMIT)
-        db_url = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:54325/postgres")
+        db_url = os.environ.get("DATABASE_URL")
+        if not db_url:
+            raise RuntimeError(
+                "DATABASE_URL 環境変数が設定されていません。"
+                ".env.local を作成して DATABASE_URL を設定してください。"
+            )
         pool = await asyncpg.create_pool(db_url, min_size=2, max_size=PG_POOL_SIZE)
         try:
             async with aiohttp.ClientSession(connector=connector) as es:
@@ -389,7 +394,12 @@ async def process_directory(
     port_manager = await OllamaPortManager.create(ollama_ports or OLLAMA_PORTS)
 
     # セッション・プールをプロセス全体で共有 → 接続再利用
-    db_url = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:54325/postgres")
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError(
+            "DATABASE_URL 環境変数が設定されていません。"
+            ".env.local を作成して DATABASE_URL を設定してください。"
+        )
     connector = aiohttp.TCPConnector(limit=HTTP_CONNECTION_LIMIT)
     pg_pool = await asyncpg.create_pool(db_url, min_size=2, max_size=PG_POOL_SIZE)
     try:
@@ -468,7 +478,14 @@ def main() -> None:
     args = parser.parse_args()
 
     load_dotenv(".env.local")
-    db_url = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:54325/postgres")
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        print(
+            "ERROR: DATABASE_URL 環境変数が設定されていません。"
+            ".env.local を作成して DATABASE_URL を設定してください。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     supabase_url = os.environ.get("SUPABASE_URL", "(不明)")
 
     log(f"接続先DB: {db_url}")
@@ -486,7 +503,7 @@ def main() -> None:
     async def _run_file() -> int:
         pm = await OllamaPortManager.create(ports)
         connector = aiohttp.TCPConnector(limit=HTTP_CONNECTION_LIMIT)
-        db_url = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:54325/postgres")
+        db_url = os.environ.get("DATABASE_URL")  # main() で検証済み
         pg_pool = await asyncpg.create_pool(db_url, min_size=2, max_size=PG_POOL_SIZE)
         try:
             async with aiohttp.ClientSession(connector=connector) as embed_session:

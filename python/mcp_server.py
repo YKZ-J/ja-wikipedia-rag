@@ -529,10 +529,13 @@ def summarize(prompt: str, mode: str = _SUMMARIZE_MODE_DEFAULT) -> str:
 # ============================================================
 def get_db_url() -> str:
     load_dotenv(".env.local")
-    return os.environ.get(
-        "DATABASE_URL",
-        "postgresql://postgres:postgres@127.0.0.1:54325/postgres",
-    )
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL 環境変数が設定されていません。"
+            ".env.local を作成して DATABASE_URL を設定してください。"
+        )
+    return url
 
 
 def _extract_search_queries_rule_based(query: str) -> tuple[str, list[str], list[str]]:
