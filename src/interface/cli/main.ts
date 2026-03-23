@@ -5,7 +5,12 @@
  * ローカル LLM で知識ベース管理
  */
 
-import type { FileResponse, QuestionResponse, SearchResponse } from "../http/mcp-client";
+import { arangeBlogDocument } from "../../application/use-cases/arange-blog";
+import type {
+  FileResponse,
+  QuestionResponse,
+  SearchResponse,
+} from "../http/mcp-client";
 import {
   askWikiRag,
   callMCP,
@@ -24,6 +29,7 @@ Usage:
   kb create "<title>" [tags...]
   kb create-wiki "<title>" [tags...]
   kb create-news "<title>" [tags...]
+  kb arange-blog "<file-name>"
   kb compare-wiki "<query>" [--title "<title>"] [tags...]
   kb search "<query>"
   kb search-all "<query>"
@@ -37,6 +43,7 @@ Examples:
   kb create "Next.js 16 最新機能" nextjs web
   kb create-wiki "TypeScript" typescript language
   kb create-news "TypeScript 最新動向" typescript news
+  kb arange-blog "5hz2-rag-local-llm-comparison"
   kb ask-wiki "富士山の標高は？"
   kb compare-wiki "アイヌ民族について教えて。世界の少数民族との共通点も教えて。3000文字程度でできるだけ詳しく" --title "RAGで変わるローカルLLMの出力精度比較検証" rag llm
   kb ask-wiki "東京の人口" wikipedia qa
@@ -48,7 +55,8 @@ Note: MCP Server must be running:
   bun run src/interface/http/mcp-server.ts
 `;
 
-const MCP_SERVER_NOTE = "\nIs MCP Server running?\n  bun run src/interface/http/mcp-server.ts";
+const MCP_SERVER_NOTE =
+  "\nIs MCP Server running?\n  bun run src/interface/http/mcp-server.ts";
 
 function handleError(error: unknown): never {
   const message = error instanceof Error ? error.message : "unknown error";
@@ -147,7 +155,9 @@ async function runSearch(args: string[], isAll: boolean): Promise<void> {
     console.error("✗ Error: query required");
     process.exit(1);
   }
-  console.log(`[KB CLI] Searching${isAll ? " (all keywords)" : ""}: "${query}"`);
+  console.log(
+    `[KB CLI] Searching${isAll ? " (all keywords)" : ""}: "${query}"`,
+  );
   const result = isAll ? await searchAllDocs(query) : await searchDocs(query);
   printSearchResult(result);
 }
@@ -197,7 +207,9 @@ async function runCreateWiki(args: string[]): Promise<void> {
     return;
   }
 
-  console.log(`[KB CLI] Creating from Wikipedia (${keywords.length} keywords)...`);
+  console.log(
+    `[KB CLI] Creating from Wikipedia (${keywords.length} keywords)...`,
+  );
   let failed = 0;
 
   for (const keyword of keywords) {
@@ -262,12 +274,27 @@ async function runCompareWiki(args: string[]): Promise<void> {
 
   const tags =
     titleFlagIndex >= 0
-      ? rest.filter((_, index) => index !== titleFlagIndex && index !== titleFlagIndex + 1)
+      ? rest.filter(
+          (_, index) =>
+            index !== titleFlagIndex && index !== titleFlagIndex + 1,
+        )
       : rest;
 
   console.log(`[KB CLI] Compare Wikipedia RAG: "${query}"`);
   const result = await createWikiRagComparison(query, title, tags);
   printFileResult(result);
+}
+
+async function runArangeBlog(args: string[]): Promise<void> {
+  const fileName = args[0] || "";
+  if (!fileName) {
+    console.error("✗ Error: file name required");
+    process.exit(1);
+  }
+
+  console.log(`[KB CLI] Arrange blog sections: "${fileName}"`);
+  const outputPath = await arangeBlogDocument(fileName);
+  console.log(`✓ Updated: ${outputPath}`);
 }
 
 async function runDefault(args: string[]): Promise<void> {
@@ -294,12 +321,16 @@ const COMMAND_HANDLERS: Record<string, () => Promise<void>> = {
   create: () => runCreate(rest),
   "create-wiki": () => runCreateWiki(rest),
   "create-news": () => runCreateNews(rest),
+  "arange-blog": () => runArangeBlog(rest),
   "ask-wiki": () => runAskWiki(rest),
   "aski-wiki": () => runAskWiki(rest),
   "compare-wiki": () => runCompareWiki(rest),
 };
 
-const handler = command in COMMAND_HANDLERS ? COMMAND_HANDLERS[command] : () => runDefault(rawArgs);
+const handler =
+  command in COMMAND_HANDLERS
+    ? COMMAND_HANDLERS[command]
+    : () => runDefault(rawArgs);
 
 try {
   await handler();
