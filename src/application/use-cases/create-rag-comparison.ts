@@ -13,12 +13,9 @@ type CreateRagComparisonInput = {
   summarize: (prompt: string) => Promise<string>;
 };
 
-const DEFAULT_IMAGE =
-  "https://ytzmpefdjnd1ueff.public.blob.vercel-storage.com/blog.webp";
+const DEFAULT_IMAGE = "https://ytzmpefdjnd1ueff.public.blob.vercel-storage.com/blog.webp";
 
-function firstNonEmpty(
-  ...values: Array<string | undefined>
-): string | undefined {
+function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
   for (const value of values) {
     if (value?.trim()) {
       return value.trim();
@@ -156,15 +153,11 @@ function createArticleBody(params: {
     "",
     "**検索クエリ（実際に使用）**",
     "",
-    ...(ragQueries.length > 0
-      ? ragQueries.map((item) => `- \`${item}\``)
-      : ["- （取得なし）"]),
+    ...(ragQueries.length > 0 ? ragQueries.map((item) => `- \`${item}\``) : ["- （取得なし）"]),
     "",
     "**参照元 Wikipedia 一覧**",
     "",
-    ...(wikiTitles.length > 0
-      ? wikiTitles.map((item) => `- 【${item}】`)
-      : ["- （取得なし）"]),
+    ...(wikiTitles.length > 0 ? wikiTitles.map((item) => `- 【${item}】`) : ["- （取得なし）"]),
     "",
     "---",
   ];
@@ -186,6 +179,7 @@ function createArticleBody(params: {
   return `## はじめに
 
 ローカルLLM（Gemma3）にRAGを組み合わせた記事生成パイプラインを用いて、RAGあり・RAGなしの出力を比較するためのレポートです。  
+実装の説明や前回からの差分も記載します。  
 ※出力した内容は必ずしも事実であるとは限りません。
 
 ## 仕組み（概要）
@@ -201,10 +195,14 @@ function createArticleBody(params: {
 生成した内容をChatGPTに評価させ、精度の違いを検証します。  
 ChatGPTへの指示は「下記の①と②の文章のファクトチェックをした上で回答精度の比較評価をしてださい」です。  
 
-使用しているwikipediaダンプ: jawiki-latest-pages-articles.xml.bz2 04-Mar-2026 01:54 4592085011
+モデル: gemma3:4b  
+wikipediaダンプ: jawiki-latest-pages-articles.xml.bz2 04-Mar-2026 01:54 4592085011  
 リポジトリ: https://github.com/YKZ-J/ja-wikipedia-rag
 
-## 今回の差分
+## 実装の説明
+
+## 前回からの差分
+
 
 ## ChatGPTによる精度比較評価
 
@@ -252,15 +250,12 @@ export async function createRagComparisonDoc({
     })
   ).filter(Boolean);
 
-  const nonRagAnswer = normalizeWhitespace(
-    await summarize(buildNonRagPrompt(trimmedQuery)),
-  );
+  const nonRagAnswer = normalizeWhitespace(await summarize(buildNonRagPrompt(trimmedQuery)));
 
   const articleSlug = buildComparisonSlug();
   const today = getTokyoDateString();
   const articleTitle =
-    title?.trim() ||
-    `RAGで変わるローカルLLMの出力精度比較検証 (${trimmedQuery})`;
+    title?.trim() || `RAGで変わるローカルLLMの出力精度比較検証 (${trimmedQuery})`;
   const articleSummary =
     "ローカルLLM（Gemma3）にRAGを組み合わせた出力とRAGなし出力を比較する自動生成レポートです。";
   const safeTitle = articleTitle.replace(/"/g, "'");

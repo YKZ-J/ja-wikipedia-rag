@@ -140,6 +140,7 @@ _LATIN_QUERY_VARIANTS = {
 _JP_QUERY_CANONICAL_VARIANTS = {
     "首相": ["内閣総理大臣", "総理大臣", "内閣総理大臣の一覧"],
     "総理": ["内閣総理大臣", "総理大臣"],
+    "狸小路": ["狸小路商店街", "札幌狸小路商店街"],
 }
 
 _EMBED_CACHE_MAX = int(os.environ.get("RAG_EMBED_CACHE_MAX", "512"))
@@ -974,13 +975,14 @@ def _merge_ranked_docs(
 async def _retrieve_rag_docs(
     query: str,
     db_url: str,
-) -> tuple[list[dict], list[str], list[list[dict]], str]:
+) -> tuple[list[dict], list[str], list[list[dict]], str, list[dict]]:
     """RAG 用の検索を実行し、統合済み候補を返す。"""
     import aiohttp
     import asyncpg
 
     _, all_vector_queries, all_title_queries, extraction_mode = await _extract_search_queries(query)
     latin_terms = list(dict.fromkeys([token.lower() for token in _RE_LATIN_TOKEN.findall(query)]))
+    subject_terms = set(re.findall(r"の([^の\s、。]{1,20})について", query))
 
     # 速度最適化: 検索クエリ本数を最小化
     # - vector: 質問全文 1件
@@ -1016,6 +1018,20 @@ async def _retrieve_rag_docs(
                 vector_queries = [all_vector_queries[0], candidate]
                 break
     title_candidates = list(dict.fromkeys(all_title_queries))
+
+    # ユーザー質問の「XのYについて」から Y を主題語として抽出し、
+    # 正式名称バリエーション（例: 狸小路 -> 狸小路商店街）を優先候補へ追加する。
+    query_title_terms = []
+    for term in re.findall(r"の([^の\s、。]{1,20})について", query):
+        query_title_terms.append(term)
+    for term in re.findall(r"([^の\s、。]{1,20})の", query):
+        query_title_terms.append(term)
+    query_title_terms = [
+        t for t in query_title_terms if t and t not in _GENERIC_SECONDARY_QUERIES and len(t) >= 2
+    ]
+    query_title_terms = _expand_canonical_variants(query_title_terms)
+    title_candidates = list(dict.fromkeys(query_title_terms + title_candidates))
+
     if latin_terms:
         boosted_latin = []
         for token in latin_terms:
@@ -1029,11 +1045,19 @@ async def _retrieve_rag_docs(
         title_candidates = [q for q in all_vector_queries[1:] if len(q) <= 24][:2]
 
     location_heads = set(re.findall(r"([^の\s、。]{1,14})\u306e", query))
+    subject_terms_prioritized = _expand_canonical_variants(sorted(subject_terms))
+    subject_terms_expanded = set(subject_terms_prioritized)
 
     def title_priority(term: str) -> tuple[int, int]:
         score = 0
         if any(k in term for k in ("観光", "名所", "イベント", "祭", "桜", "春")):
             score += 30
+        if subject_terms_expanded and any(st and st in term for st in subject_terms_expanded):
+            score += 70
+        if len(term) > 18:
+            score -= 35
+        if any(k in term for k in ("概要", "歴史", "機能", "使い方", "解説")):
+            score -= 30
         if " " in term:
             score += 8
         if term in location_heads:
@@ -1042,13 +1066,31 @@ async def _retrieve_rag_docs(
             score -= 20
         if term in _GENERIC_SECONDARY_QUERIES:
             score -= 20
-        return score, len(term)
+        # 同点時は短い見出し語を優先する。
+        return score, -len(term)
 
     title_candidates.sort(key=title_priority, reverse=True)
-    if len(latin_terms) >= 2:
-        title_queries = latin_terms[:2]
-    else:
-        title_queries = title_candidates[:2]
+
+    # 英字固有名詞はタイトル一致検索の強シグナルなので、優先候補から落とさない。
+    # 例: "firebaseを説明して" では Firebase を必ず title_search に流す。
+    title_queries: list[str] = []
+    if latin_terms:
+        for token in latin_terms[:2]:
+            for variant in (token, token.capitalize()):
+                if variant not in title_queries:
+                    title_queries.append(variant)
+
+    preferred_subject_candidates = [
+        term for term in subject_terms_prioritized if term and term not in _GENERIC_SECONDARY_QUERIES
+    ]
+    merged_title_candidates = list(dict.fromkeys(preferred_subject_candidates + title_candidates))
+
+    for candidate in merged_title_candidates:
+        if candidate in title_queries:
+            continue
+        title_queries.append(candidate)
+
+    title_queries = title_queries[:4] if latin_terms else title_queries[:2]
     # アンカー語は検索に使わない分も保持して再ランキングで活用
     anchor_terms = [q for q in all_vector_queries[1:4] if q]
     for tq in title_queries:
@@ -1196,8 +1238,10 @@ async def _retrieve_rag_docs(
             if filtered_docs:
                 docs = filtered_docs
 
+    ranked_top10_docs = docs[:10]
+
     # Gemma3 入力は最大 3 件（ランキング上位を優先）
-    return docs[:3], vector_queries, title_lists, extraction_mode
+    return docs[:3], vector_queries, title_lists, extraction_mode, ranked_top10_docs
 
 
 def _build_rag_messages(context: str, user_prompt: str) -> list[dict[str, str]]:
@@ -1213,6 +1257,7 @@ def _build_rag_messages(context: str, user_prompt: str) -> list[dict[str, str]]:
         "- 文字数指定がある場合は必ずその文字数を目安に記述すること。沿革・組織・特色・研究など複数の観点から網羅的に解説。\n"
         "- 箇条書き中心ではなく、段落形式の説明文で記述。\n"
         "- 逆質問や前置きは不要。\n"
+        "- 数学に関しての回答は参照資料にある公式と用語を使うこと。\n"
         "- 参照資料に含まれない事実を創作しないこと。"
     )
     # コンテキストを先に配置し、質問を末尾に置く。
@@ -1273,8 +1318,14 @@ async def rag_ask(
     import aiohttp
 
     db_url: str = get_db_url()
-    docs, sub_queries, title_lists, extraction_mode = await _retrieve_rag_docs(query, db_url)
+    docs, sub_queries, title_lists, extraction_mode, ranked_top10_docs = await _retrieve_rag_docs(query, db_url)
     print(f"[rag_ask] query_extraction_mode={extraction_mode}", file=sys.stderr)
+
+    ranking_lines = [
+        f"{index}. 【{doc['title']}】 (id={doc['id']})"
+        for index, doc in enumerate(ranked_top10_docs, start=1)
+    ]
+    ranking_text = "\n".join(ranking_lines) if ranking_lines else "（取得なし）"
 
     # --- Ollama Gemma3 で回答生成（非同期） ---
     if not docs:
@@ -1473,6 +1524,7 @@ async def rag_ask(
         f"# 質問\n{query}\n\n"
         f"# 回答\n{answer}\n\n"
         f"# 検索クエリ抽出モード\n{extraction_mode}\n\n"
+        f"# 検索ランキング (取得上位10件)\n{ranking_text}\n\n"
         f"# 検索クエリ (実際に使用)\n"
         + "\n".join([f"- `{sq}`" for sq in sub_queries])
         + "\n\n"
