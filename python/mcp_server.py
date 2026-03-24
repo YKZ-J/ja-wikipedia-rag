@@ -101,6 +101,8 @@ _RE_DETAIL_SPEC = re.compile(
     r"\d+\s*(?:文字|字)\s*(?:程度|以上|以内|ほど)?\s*(?:で\s*)?(?:できるだけ\s*)?(?:詳しく\s*|詳細に\s*)?|(?:できるだけ\s*)?(?:詳しく|詳細に)\s*$|できるだけ\s*$"
 )
 _RE_LATIN_TOKEN = re.compile(r"[a-zA-Z]{2,16}")
+_RE_GROUNDED_TOKEN = re.compile(r"[A-Za-z0-9\u3040-\u30ff\u4e00-\u9fff]{2,30}")
+_RE_TITLE_BOUNDARY_TEMPLATE = r"(^|[\s\-・/()\[\]{}（）「」『』])%s($|[\s\-・/()\[\]{}（）「」『』])"
 # フォールバック抽出は漢字/カタカナ中心に限定してノイズを抑える
 # ひらがな語は「〜の」「〜について」抽出側で拾う
 _RE_JP_KEYWORD = re.compile(r"[\u30a0-\u30ff\u4e00-\u9fff]{1,14}")
@@ -809,6 +811,180 @@ def _parse_json_object_from_text(text: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _collect_grounding_tokens(query: str, seed_terms: list[str] | None = None) -> set[str]:
+    """ユーザー質問に根拠のある語（+安全な展開語）を収集する。"""
+    cleaned = _RE_INSTRUCTION_SUFFIX.sub("", query).strip() or query
+    cleaned = _RE_DETAIL_SPEC.sub("", cleaned).strip() or cleaned
+    lowered_cleaned = cleaned.lower()
+
+    tokens: set[str] = set()
+
+    for token in _RE_JP_KEYWORD.findall(cleaned):
+        if len(token) >= 2 and token not in _GENERIC_SECONDARY_QUERIES:
+            tokens.add(token)
+
+    for token in _RE_LATIN_TOKEN.findall(cleaned):
+        tokens.add(token.lower())
+        tokens.add(token.capitalize())
+
+    # 安全な正式名称展開（質問内に短縮語があるときのみ）
+    for short, variants in _JP_QUERY_CANONICAL_VARIANTS.items():
+        if short in cleaned:
+            tokens.add(short)
+            for variant in variants:
+                tokens.add(variant)
+                for part in _RE_GROUNDED_TOKEN.findall(variant):
+                    tokens.add(part)
+
+    for latin, variants in _LATIN_QUERY_VARIANTS.items():
+        if latin in lowered_cleaned:
+            tokens.add(latin)
+            tokens.add(latin.capitalize())
+            for variant in variants:
+                tokens.add(variant)
+
+    if seed_terms:
+        for term in seed_terms:
+            normalized = _normalize_query_term(term)
+            if not normalized:
+                continue
+            tokens.add(normalized)
+            for part in _RE_GROUNDED_TOKEN.findall(normalized):
+                if len(part) >= 2 and part not in _GENERIC_SECONDARY_QUERIES:
+                    tokens.add(part)
+
+    return {token for token in tokens if token and len(token) >= 2}
+
+
+def _is_grounded_term(term: str, grounding_tokens: set[str]) -> bool:
+    """語が質問由来トークンに十分アンカーされているかを判定する。"""
+    normalized = _normalize_query_term(term)
+    if not normalized:
+        return False
+
+    lower_term = normalized.lower()
+    if normalized in grounding_tokens or lower_term in grounding_tokens:
+        return True
+
+    parts = [p for p in _RE_GROUNDED_TOKEN.findall(normalized) if p not in _GENERIC_SECONDARY_QUERIES]
+    if not parts:
+        return False
+
+    matched = 0
+    for part in parts:
+        lower_part = part.lower()
+        if (
+            part in grounding_tokens
+            or lower_part in grounding_tokens
+            or any(token in part for token in grounding_tokens)
+        ):
+            matched += 1
+
+    # 一部一致のみで全体が乖離するケース（幻覚固有名詞の混入）を抑制
+    return matched >= 1 and (matched / len(parts)) >= 0.5
+
+
+def _sanitize_grounded_phrase(term: str, grounding_tokens: set[str]) -> str:
+    """空白区切り語を質問根拠ベースで間引きし、不適切な尾部追加を除去する。"""
+    normalized = _normalize_query_term(term)
+    if not normalized:
+        return ""
+
+    chunks = [chunk for chunk in normalized.split(" ") if chunk]
+    if len(chunks) <= 1:
+        return normalized if _is_grounded_term(normalized, grounding_tokens) else ""
+
+    kept = [chunk for chunk in chunks if _is_grounded_term(chunk, grounding_tokens)]
+    if not kept:
+        return ""
+    return _normalize_query_term(" ".join(kept))
+
+
+def _ensure_primary_query_first(
+    query: str,
+    vector_queries: list[str],
+    search_base: str,
+) -> list[str]:
+    """主軸ベクトル検索は必ずユーザー原文を先頭にする。"""
+    normalized_query = _normalize_query_term(query)
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add_term(value: str) -> None:
+        term = _normalize_query_term(value)
+        if not term or term in seen:
+            return
+        seen.add(term)
+        out.append(term)
+
+    add_term(normalized_query)
+    add_term(search_base)
+    for term in vector_queries:
+        add_term(term)
+
+    return out[:6]
+
+
+def _title_boundary_match(title: str, noun: str) -> bool:
+    """タイトル内で noun が単語境界に近い形で一致するかを判定する。"""
+    if not noun:
+        return False
+    pattern = _RE_TITLE_BOUNDARY_TEMPLATE % re.escape(noun)
+    return bool(re.search(pattern, title))
+
+
+def _contains_noisy_affix(title: str, noun: str) -> bool:
+    """`noun` が他語の一部として連結されるノイズ一致を検出する。"""
+    if not noun or noun not in title:
+        return False
+    for idx in range(len(title)):
+        pos = title.find(noun, idx)
+        if pos == -1:
+            break
+        end = pos + len(noun)
+        prev_char = title[pos - 1] if pos > 0 else ""
+        next_char = title[end] if end < len(title) else ""
+        prev_is_boundary = (not prev_char) or bool(
+            re.match(r"[\s\-・/()\[\]{}（）「」『』]", prev_char)
+        )
+        next_is_boundary = (not next_char) or bool(
+            re.match(r"[\s\-・/()\[\]{}（）「」『』]", next_char)
+        )
+        if not (prev_is_boundary or next_is_boundary):
+            return True
+        idx = pos + 1
+    return False
+
+
+def _score_title_match(title: str, noun: str) -> float:
+    """タイトル一致の質をスコア化する。部分一致ノイズを下げる。"""
+    if not noun:
+        return 0.0
+
+    score = 0.0
+    if title == noun:
+        score += 200.0
+    elif title == f"{noun}一覧":
+        score += 190.0
+    elif _title_boundary_match(title, noun):
+        score += 150.0
+    elif noun in title:
+        score += 85.0
+
+    if title.startswith(noun):
+        score += 16.0
+    if title.endswith(noun):
+        score += 16.0
+
+    if _contains_noisy_affix(title, noun):
+        score -= 55.0
+
+    if any(sym in title for sym in ("!", "！", "?", "？")):
+        score -= 12.0
+
+    return score
+
+
 async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str], list[str]]:
     """Gemma3 で質問整形を行い、検索クエリ候補を返す。"""
     import aiohttp
@@ -871,9 +1047,15 @@ async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]
             f"(done_reason={done_reason}, preview={preview!r})"
         )
 
+    rb_search_base, rb_vector_queries, rb_title_queries = _extract_search_queries_rule_based(query)
+    grounding_tokens = _collect_grounding_tokens(query, [rb_search_base, *rb_vector_queries, *rb_title_queries])
+
     search_base_raw = str(parsed.get("search_base", "")).strip()
     search_base = _normalize_query_term(search_base_raw) or _normalize_query_term(query)
     search_base = _apply_canonical_replacements(search_base)
+    search_base = _sanitize_grounded_phrase(search_base, grounding_tokens) or _normalize_query_term(
+        rb_search_base
+    )
 
     vector_raw = parsed.get("vector_queries")
     title_raw = parsed.get("title_queries")
@@ -885,21 +1067,33 @@ async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]
     for candidate in vector_seed:
         if not isinstance(candidate, str):
             continue
-        term = _normalize_query_term(candidate)
+        term = _sanitize_grounded_phrase(candidate, grounding_tokens)
         if not term:
+            continue
+        if not _is_grounded_term(term, grounding_tokens):
             continue
         if term not in vector_queries:
             vector_queries.append(term)
         if len(vector_queries) >= 6:
             break
 
+    for candidate in rb_vector_queries:
+        if len(vector_queries) >= 6:
+            break
+        term = _normalize_query_term(candidate)
+        if not term or term in vector_queries:
+            continue
+        vector_queries.append(term)
+
     title_queries: list[str] = []
     title_seed = _expand_canonical_variants([search_base, *title_candidates])
     for candidate in title_seed:
         if not isinstance(candidate, str):
             continue
-        term = _normalize_query_term(candidate)
+        term = _sanitize_grounded_phrase(candidate, grounding_tokens)
         if not term:
+            continue
+        if not _is_grounded_term(term, grounding_tokens):
             continue
         if term in title_queries:
             continue
@@ -907,8 +1101,18 @@ async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]
         if len(title_queries) >= 6:
             break
 
+    for candidate in rb_title_queries:
+        if len(title_queries) >= 6:
+            break
+        term = _normalize_query_term(candidate)
+        if not term or term in title_queries:
+            continue
+        title_queries.append(term)
+
     if not vector_queries:
-        vector_queries = [search_base]
+        vector_queries = [search_base or _normalize_query_term(rb_search_base)]
+
+    vector_queries = _ensure_primary_query_first(query, vector_queries, search_base)
 
     return search_base, vector_queries, title_queries
 
@@ -1125,21 +1329,28 @@ async def _retrieve_rag_docs(
         return [{"id": r["id"], "title": r["title"], "content": r["content"]} for r in rows]
 
     async def title_search(pool: "asyncpg.Pool", noun: str) -> list[dict]:
+        normalized_noun = _normalize_query_term(noun)
+        if not normalized_noun:
+            return []
+
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT id, title, content FROM documents
                    WHERE title = $1 OR title = $2 OR title ILIKE $3
-                   ORDER BY
-                     CASE WHEN title = $1 THEN 0
-                          WHEN title = $2 THEN 1
-                          ELSE 2 END,
-                     length(title) ASC
-                                     LIMIT 10""",
-                f"{noun}一覧",
-                noun,
-                f"%{noun}%",
+                   LIMIT 80""",
+                f"{normalized_noun}一覧",
+                normalized_noun,
+                f"%{normalized_noun}%",
             )
-        return [{"id": r["id"], "title": r["title"], "content": r["content"]} for r in rows]
+        docs = [{"id": r["id"], "title": r["title"], "content": r["content"]} for r in rows]
+        scored_docs: list[tuple[float, int, dict]] = []
+        for doc in docs:
+            title = str(doc["title"])
+            score = _score_title_match(title, normalized_noun)
+            scored_docs.append((score, -len(title), doc))
+
+        scored_docs.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [item[2] for item in scored_docs[:10]]
 
     async def wrapped_search(task_type: str, coro: "asyncio.Future[list[dict]]") -> tuple[str, list[dict] | None, Exception | None]:
         try:

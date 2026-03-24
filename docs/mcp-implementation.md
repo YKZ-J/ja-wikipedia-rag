@@ -1,5 +1,272 @@
 # MCP 実装の全容
 
+## MCPサーバー構築実践ガイド
+
+このドキュメントは、Bun(TypeScript) クライアントから Python FastMCP サーバーを呼び出す MCP 構成を、ゼロから作れるレベルで解説します。
+
+対象構成:
+
+- クライアント: Bun + TypeScript
+- サーバー: Python + FastMCP
+- LLM: Ollama（ローカル）
+- 検索基盤: Supabase(PostgreSQL + pgvector)
+
+#### 1. MCPとは何か（このプロジェクトでの役割）
+
+MCP は「LLMに渡すツール実行インターフェース」を標準化するためのプロトコルです。
+
+このプロジェクトでは次の役割を持ちます。
+
+1. TypeScript から Python を安全に呼ぶ
+2. LLM処理（生成・要約・RAG）を tool 単位で分離する
+3. ツール入出力を構造化し、CLI から再利用しやすくする
+
+実行フロー:
+
+1. `kb` コマンド実行
+2. TypeScript クライアントが Python FastMCP を stdio 起動
+3. `callTool` で `generate_doc` / `summarize` / `rag_ask` を実行
+4. Python が Ollama / DB を呼び出して結果を返す
+
+#### 2. 使うライブラリ
+
+#### 2.1 TypeScript側
+
+- `@modelcontextprotocol/sdk`
+  - MCP クライアント本体
+  - 使う主なクラス: `Client`, `StdioClientTransport`
+- `zod`
+  - HTTP 経由の入力バリデーション
+- `gray-matter`
+  - Markdown frontmatter の読み書き
+- `unified`, `remark-parse`, `unist-util-visit`
+  - Markdown AST の解析
+
+インストール例:
+
+```bash
+bun add @modelcontextprotocol/sdk zod gray-matter unified remark-parse unist-util-visit
+```
+
+#### 2.2 Python側
+
+- `mcp`（FastMCP）
+  - Python MCP サーバーを実装
+  - `FastMCP(...)`, `@mcp.tool()` を利用
+- `llama-cpp-python`
+  - `.gguf` モデルをローカル推論
+- `aiohttp`
+  - Ollama API 呼び出し（`/api/chat`, `/api/generate`, `/api/embed`）
+- `asyncpg`
+  - PostgreSQL 非同期アクセス
+- `python-dotenv`
+  - `.env.local` から設定ロード
+
+インストール例:
+
+```bash
+source .venv/bin/activate
+pip install mcp llama-cpp-python aiohttp asyncpg python-dotenv
+```
+
+### 3. 最小MCPサーバーを作る（Python）
+
+ファイル例: `python/mcp_server.py`
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("kb-llm-server")
+
+@mcp.tool()
+def summarize(prompt: str) -> str:
+    # 実際はここで LLM を呼ぶ
+    return f"要約結果: {prompt[:80]}"
+
+if __name__ == "__main__":
+    mcp.run()
+```
+
+ポイント:
+
+- `FastMCP("server-name")` でサーバー名を定義
+- `@mcp.tool()` を付けた関数が公開ツールになる
+- 引数・戻り値はシンプルな型（`str`, `int`, `bool` など）を基本にする
+
+### 4. Bunクライアントを作る（TypeScript）
+
+ファイル例: `src/infrastructure/llm/llama-bridge.ts`
+
+```ts
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+const transport = new StdioClientTransport({
+  command: "python3",
+  args: ["python/mcp_server.py"],
+  env: process.env as Record<string, string>,
+});
+
+const client = new Client({ name: "kb-llm-client", version: "1.0.0" });
+await client.connect(transport);
+
+const result = await client.callTool({
+  name: "summarize",
+  arguments: { prompt: "テスト入力" },
+});
+```
+
+ポイント:
+
+- Python を stdio で起動するため運用が簡単
+- `Client` は毎回作らずシングルトン化すると安定
+- 複数同時 `callTool` はタイムアウト要因になるため、キュー直列化が安全
+
+### 5. 実運用向けに必要な設計
+
+#### 5.1 ツール分割
+
+このリポジトリでは下記の3ツールに分割しています。
+
+- `generate_doc`: 長文生成 + Markdown保存
+- `summarize`: 要約・単発応答
+- `rag_ask`: 検索 + 回答生成
+
+分割する理由:
+
+- タイムアウト設定を用途別に最適化できる
+- 障害点を切り分けやすい
+- テストしやすい
+
+#### 5.2 タイムアウト管理
+
+TypeScript 側で tool ごとにタイムアウトを分けます。
+
+例:
+
+- `KB_RAG_ASK_TIMEOUT_MS=300000`
+- `KB_SUMMARIZE_TIMEOUT_MS=300000`
+- `KB_GENERATE_DOC_TIMEOUT_MS=180000`
+
+#### 5.3 タイムゾーン
+
+日付出力は `Asia/Tokyo` 固定で統一します。
+
+```python
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+today = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d")
+```
+
+### 6. RAGツールの作り方（実装手順）
+
+`rag_ask` を実装する基本手順:
+
+1. ユーザー質問から検索クエリ候補を抽出
+2. 埋め込みモデルでベクトル化（Ollama embed API）
+3. PostgreSQL の `search_documents` RPC で候補取得
+4. タイトル一致検索を補助シグナルとして追加
+5. 再ランキングして上位記事を決定
+6. 参照本文をコンテキスト化して LLM に投入
+7. 回答・検索クエリ・ランキングを Markdown 保存
+
+検索品質の実装注意:
+
+- 主軸検索クエリはユーザー原文を先頭固定
+- 質問にない固有名詞が抽出された場合は破棄
+- タイトル一致は「境界一致」を優先し、部分一致ノイズを減点
+
+### 7. 設定ファイルと環境変数
+
+必須:
+
+- `MODEL_PATH`: `.gguf` ファイルパス
+- `DATABASE_URL`: Supabase/PostgreSQL 接続文字列
+- `VAULT_PATH`: 出力ディレクトリ
+
+推奨:
+
+- `RAG_DB_MAX_CONCURRENCY`
+- `RAG_DB_QUERY_TIMEOUT_SEC`
+- `RAG_MAX_CONTEXT_CHARS`
+- `RAG_MIN_CONTEXT_CHARS`
+- `RAG_QUERY_NORMALIZATION_NUM_PREDICT`
+
+### 8. 具体的な起動手順
+
+```bash
+bun install
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Supabase / DB 起動
+docker compose up -d
+supabase start
+
+# TypeScript MCP サーバー起動
+bun run src/interface/http/mcp-server.ts
+```
+
+確認:
+
+1. `kb search "テスト"` が動く
+2. `kb ask-wiki "テスト"` が動く
+3. `vault/` に生成ファイルが保存される
+
+### 9. よくある失敗と対策
+
+#### 9.1 `Unable to connect`
+
+原因:
+
+- Python MCP が起動していない
+- Ollama が停止している
+- 環境変数不足
+
+対策:
+
+1. Ollama の待受確認
+2. `MODEL_PATH` / `DATABASE_URL` の確認
+3. Python プロセス再起動
+
+#### 9.2 検索精度が悪い
+
+原因:
+
+- 抽出クエリへの幻覚語混入
+- タイトル部分一致ノイズ
+- RPC 側 LIMIT 不足
+
+対策:
+
+1. クエリ抽出に「質問語アンカー」検証を入れる
+2. タイトル境界一致を優先する
+3. `search_documents` の LIMIT / インデックス設計を見直す
+
+#### 9.3 生成が途中で切れる
+
+原因:
+
+- `num_predict` 不足
+
+対策:
+
+1. `done_reason=length` を検知
+2. `num_predict` を増やして1回だけ再試行
+
+## 10. 実装完了条件
+
+実装変更後は必ず次を実行します。
+
+```bash
+bun run lint
+bun run test
+bun run build
+```
+
+3つすべて成功したら完了です。
+
 ## アーキテクチャ概要
 
 ```
