@@ -1,12 +1,19 @@
 #!/usr/bin/env bun
+
 /**
  * KB CLI エントリーポイント
  *
  * ローカル LLM で知識ベース管理
  */
 
+import { createInterface } from "node:readline/promises";
 import { arangeBlogDocument } from "../../application/use-cases/arange-blog";
-import type { FileResponse, QuestionResponse, SearchResponse } from "../http/mcp-client";
+import type {
+  FileResponse,
+  QuestionResponse,
+  SearchResponse,
+  WikiRagRanking,
+} from "../http/mcp-client";
 import {
   askWikiRag,
   callMCP,
@@ -14,6 +21,7 @@ import {
   createNewsDoc,
   createWikiDoc,
   createWikiRagComparison,
+  previewWikiRagRankings,
   questionDocs,
   searchAllDocs,
   searchDocs,
@@ -51,7 +59,8 @@ Note: MCP Server must be running:
   bun run src/interface/http/mcp-server.ts
 `;
 
-const MCP_SERVER_NOTE = "\nIs MCP Server running?\n  bun run src/interface/http/mcp-server.ts";
+const MCP_SERVER_NOTE =
+  "\nIs MCP Server running?\n  bun run src/interface/http/mcp-server.ts";
 
 function handleError(error: unknown): never {
   const message = error instanceof Error ? error.message : "unknown error";
@@ -85,6 +94,86 @@ function splitWikiKeywords(input: string): string[] {
     .split(/\s+/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function parseSelectedRanks(input: string, maxRank: number): number[] {
+  const values = input
+    .trim()
+    .split(/[\s,]+/)
+    .map((value) => Number.parseInt(value, 10))
+    .filter(
+      (value) => Number.isInteger(value) && value >= 1 && value <= maxRank,
+    );
+
+  return Array.from(new Set(values));
+}
+
+async function chooseTwoWikiDocIds(query: string): Promise<number[]> {
+  const preview = await previewWikiRagRankings(query);
+  if (!preview.ok) {
+    console.error(`✗ Error: ${preview.error}`);
+    process.exit(1);
+  }
+
+  const rankings = preview.rankings.slice(0, 10);
+  if (rankings.length === 0) {
+    console.log(
+      "[KB CLI] 検索ランキング候補が取得できなかったため、通常処理を続行します。",
+    );
+    return [];
+  }
+
+  console.log("\n# 検索クエリ抽出モード");
+  console.log(preview.extractionMode);
+  console.log("\n# 検索ランキング (取得上位10件)");
+  for (const item of rankings) {
+    console.log(`${item.rank}. 【${item.title}】 (id=${item.id})`);
+  }
+  console.log("\n# 検索クエリ (実際に使用)");
+  for (const q of preview.searchQueries) {
+    console.log(`- \`${q}\``);
+  }
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    const fallback = rankings.slice(0, 2).map((item) => item.id);
+    console.log("\n[KB CLI] 非対話モードのため、上位2件を自動選択します。");
+    return fallback;
+  }
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    while (true) {
+      const answer = await rl.question(
+        "\n使用する記事の順位を2つ入力してください（例: 2 8 / Enterで上位2件）: ",
+      );
+
+      if (!answer.trim()) {
+        return rankings.slice(0, 2).map((item) => item.id);
+      }
+
+      const selectedRanks = parseSelectedRanks(answer, rankings.length);
+      if (selectedRanks.length !== 2) {
+        console.log("順位は重複なしで2つ指定してください。");
+        continue;
+      }
+
+      const selected = selectedRanks
+        .map((rank) => rankings.find((item) => item.rank === rank))
+        .filter((item): item is WikiRagRanking => item !== undefined);
+
+      if (selected.length !== 2) {
+        console.log("指定した順位が不正です。もう一度入力してください。");
+        continue;
+      }
+
+      console.log(
+        `選択記事: ${selected.map((item) => `【${item.title}】`).join(", ")}`,
+      );
+      return selected.map((item) => item.id);
+    }
+  } finally {
+    rl.close();
+  }
 }
 
 function printSearchResult(result: SearchResponse): void {
@@ -150,7 +239,9 @@ async function runSearch(args: string[], isAll: boolean): Promise<void> {
     console.error("✗ Error: query required");
     process.exit(1);
   }
-  console.log(`[KB CLI] Searching${isAll ? " (all keywords)" : ""}: "${query}"`);
+  console.log(
+    `[KB CLI] Searching${isAll ? " (all keywords)" : ""}: "${query}"`,
+  );
   const result = isAll ? await searchAllDocs(query) : await searchDocs(query);
   printSearchResult(result);
 }
@@ -200,7 +291,9 @@ async function runCreateWiki(args: string[]): Promise<void> {
     return;
   }
 
-  console.log(`[KB CLI] Creating from Wikipedia (${keywords.length} keywords)...`);
+  console.log(
+    `[KB CLI] Creating from Wikipedia (${keywords.length} keywords)...`,
+  );
   let failed = 0;
 
   for (const keyword of keywords) {
@@ -240,7 +333,8 @@ async function runAskWiki(args: string[]): Promise<void> {
     process.exit(1);
   }
   console.log(`[KB CLI] Wikipedia RAG: "${query}"`);
-  const result = await askWikiRag(query, tags);
+  const selectedDocIds = await chooseTwoWikiDocIds(query);
+  const result = await askWikiRag(query, tags, selectedDocIds);
   printFileResult(result);
 }
 
@@ -265,11 +359,20 @@ async function runCompareWiki(args: string[]): Promise<void> {
 
   const tags =
     titleFlagIndex >= 0
-      ? rest.filter((_, index) => index !== titleFlagIndex && index !== titleFlagIndex + 1)
+      ? rest.filter(
+          (_, index) =>
+            index !== titleFlagIndex && index !== titleFlagIndex + 1,
+        )
       : rest;
 
   console.log(`[KB CLI] Compare Wikipedia RAG: "${query}"`);
-  const result = await createWikiRagComparison(query, title, tags);
+  const selectedDocIds = await chooseTwoWikiDocIds(query);
+  const result = await createWikiRagComparison(
+    query,
+    title,
+    tags,
+    selectedDocIds,
+  );
   printFileResult(result);
 }
 
@@ -315,7 +418,10 @@ const COMMAND_HANDLERS: Record<string, () => Promise<void>> = {
   "compare-wiki": () => runCompareWiki(rest),
 };
 
-const handler = command in COMMAND_HANDLERS ? COMMAND_HANDLERS[command] : () => runDefault(rawArgs);
+const handler =
+  command in COMMAND_HANDLERS
+    ? COMMAND_HANDLERS[command]
+    : () => runDefault(rawArgs);
 
 try {
   await handler();

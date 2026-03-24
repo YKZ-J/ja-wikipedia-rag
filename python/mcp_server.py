@@ -1458,6 +1458,41 @@ async def _retrieve_rag_docs(
     return docs[:3], vector_queries, title_lists, extraction_mode, ranked_top10_docs
 
 
+def _parse_selected_doc_ids(raw: str) -> list[int]:
+    """CLIから渡された選択ID文字列を数値配列へ変換する。"""
+    tokens = [token for token in re.split(r"[\s,]+", (raw or "").strip()) if token]
+    selected: list[int] = []
+    seen: set[int] = set()
+    for token in tokens:
+        if not token.isdigit():
+            continue
+        value = int(token)
+        if value in seen:
+            continue
+        seen.add(value)
+        selected.append(value)
+        if len(selected) >= 2:
+            break
+    return selected
+
+
+@mcp.tool()
+async def rag_rankings(query: str) -> str:
+    """質問に対するRAG検索ランキング上位10件をJSONで返す。"""
+    db_url: str = get_db_url()
+    _, sub_queries, _, extraction_mode, ranked_top10_docs = await _retrieve_rag_docs(query, db_url)
+    payload = {
+        "query": query,
+        "extraction_mode": extraction_mode,
+        "search_queries": sub_queries,
+        "rankings": [
+            {"rank": idx, "id": int(doc["id"]), "title": str(doc["title"])}
+            for idx, doc in enumerate(ranked_top10_docs, start=1)
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _build_rag_messages(context: str, user_prompt: str) -> list[dict[str, str]]:
     """Gemma3 chat API 用の system/user/assistant(先行注入) メッセージを構築する。"""
     system_msg = (
@@ -1520,6 +1555,7 @@ async def rag_ask(
     query: str,
     vault_dir: str = "",
     tags: str = "",
+    selected_doc_ids: str = "",
 ) -> str:
     """
     ローカル Wikipedia vectorDB を検索し Gemma3(Ollama) で回答を生成して Vault に保存する。
@@ -1533,6 +1569,30 @@ async def rag_ask(
 
     db_url: str = get_db_url()
     docs, sub_queries, title_lists, extraction_mode, ranked_top10_docs = await _retrieve_rag_docs(query, db_url)
+    selected_ids = _parse_selected_doc_ids(selected_doc_ids)
+
+    if selected_ids and ranked_top10_docs:
+        ranked_by_id = {int(doc["id"]): doc for doc in ranked_top10_docs}
+        selected_docs: list[dict] = []
+        selected_seen: set[int] = set()
+        for selected_id in selected_ids:
+            if selected_id in selected_seen:
+                continue
+            doc = ranked_by_id.get(selected_id)
+            if not doc:
+                continue
+            selected_seen.add(selected_id)
+            selected_docs.append(doc)
+
+        if selected_docs:
+            docs = selected_docs
+            for fallback_doc in ranked_top10_docs:
+                fallback_id = int(fallback_doc["id"])
+                if fallback_id in selected_seen:
+                    continue
+                docs.append(fallback_doc)
+                if len(docs) >= 2:
+                    break
     print(f"[rag_ask] query_extraction_mode={extraction_mode}", file=sys.stderr)
 
     ranking_lines = [

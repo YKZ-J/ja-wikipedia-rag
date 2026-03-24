@@ -11,10 +11,14 @@ import { z } from "zod";
 import { createNewsArticle } from "../../application/use-cases/create-news";
 import { createRagComparisonDoc } from "../../application/use-cases/create-rag-comparison";
 import { createDocFromWikipedia } from "../../application/use-cases/create-wiki-doc";
-import { searchAllDocs, searchDocs } from "../../application/use-cases/search-docs";
+import {
+  searchAllDocs,
+  searchDocs,
+} from "../../application/use-cases/search-docs";
 import {
   runPythonLLM,
   runPythonRAGDoc,
+  runPythonRAGRankings,
   runPythonSummaryWithMode,
 } from "../../infrastructure/llm/llama-bridge";
 import { getTokyoDateString } from "../../shared/lib/date";
@@ -70,7 +74,8 @@ function buildQuestionPrompt(
   matches: Array<{ summary?: string; body?: string }>,
   question: string,
 ): string {
-  let prompt = "以下のドキュメント内容を参考に回答してください（タイトル・スラッグは除外）:\n\n";
+  let prompt =
+    "以下のドキュメント内容を参考に回答してください（タイトル・スラッグは除外）:\n\n";
   for (const doc of matches.slice(0, 3)) {
     const parts = [doc.summary, doc.body].filter(Boolean);
     if (parts.length > 0) prompt += `${parts.join("\n")}\n\n`;
@@ -94,7 +99,8 @@ function createMcpServer(): McpServer {
     "create_doc",
     {
       title: "ドキュメント生成 (LLM)",
-      description: "LLM で技術ドキュメントを生成して Vault に保存し、ファイルパスを返す",
+      description:
+        "LLM で技術ドキュメントを生成して Vault に保存し、ファイルパスを返す",
       inputSchema: {
         title: z.string().min(1).describe("ドキュメントのタイトル"),
         tags: z.array(z.string()).optional().describe("タグリスト"),
@@ -113,7 +119,8 @@ function createMcpServer(): McpServer {
     "create_doc_wiki",
     {
       title: "Wikipedia ドキュメント生成",
-      description: "Wikipedia から情報を取得して Vault に Markdown ドキュメントを保存する",
+      description:
+        "Wikipedia から情報を取得して Vault に Markdown ドキュメントを保存する",
       inputSchema: {
         title: z.string().min(1).describe("Wikipedia 検索キーワード"),
         tags: z.array(z.string()).optional().describe("タグリスト"),
@@ -131,7 +138,8 @@ function createMcpServer(): McpServer {
     "create_news",
     {
       title: "ニュース記事生成",
-      description: "ソースディレクトリのファイルをもとに LLM でニュース記事を生成する",
+      description:
+        "ソースディレクトリのファイルをもとに LLM でニュース記事を生成する",
       inputSchema: {
         title: z.string().min(1).describe("記事のテーマタイトル"),
         tags: z.array(z.string()).optional().describe("タグリスト"),
@@ -198,13 +206,31 @@ function createMcpServer(): McpServer {
     async ({ query, question }) => {
       console.log(`[MCP] question_docs: "${query}"`);
       const searchResult = await searchAllDocs(query, async () => "");
-      const matches = Array.isArray(searchResult.matches) ? searchResult.matches : [];
+      const matches = Array.isArray(searchResult.matches)
+        ? searchResult.matches
+        : [];
       if (matches.length === 0) {
         return jsonText({ matches: [], answer: "" });
       }
       const llmPrompt = buildQuestionPrompt(matches, question);
       const answer = await runPythonSummaryWithMode(llmPrompt, "qa_non_rag");
       return jsonText({ matches, answer });
+    },
+  );
+
+  server.registerTool(
+    "preview_wiki_rag_rankings",
+    {
+      title: "Wikipedia RAG ランキング取得",
+      description: "質問に対する検索ランキング上位10件を返す",
+      inputSchema: {
+        query: z.string().min(1).describe("質問文字列"),
+      },
+    },
+    async ({ query }) => {
+      console.log(`[MCP] preview_wiki_rag_rankings: "${query}"`);
+      const preview = await runPythonRAGRankings(query);
+      return jsonText(preview);
     },
   );
 
@@ -217,11 +243,15 @@ function createMcpServer(): McpServer {
       inputSchema: {
         query: z.string().min(1).describe("質問文字列"),
         tags: z.array(z.string()).optional().describe("タグリスト"),
+        selectedDocIds: z
+          .array(z.number().int().positive())
+          .optional()
+          .describe("使用するWikipedia記事ID（最大2件）"),
       },
     },
-    async ({ query, tags = [] }) => {
+    async ({ query, tags = [], selectedDocIds = [] }) => {
       console.log(`[MCP] ask_wiki_rag: "${query}"`);
-      const filePath = await runPythonRAGDoc(query, tags);
+      const filePath = await runPythonRAGDoc(query, tags, selectedDocIds);
       console.log(`[MCP] Generated: ${filePath}`);
       return jsonText({ file: filePath });
     },
@@ -237,16 +267,21 @@ function createMcpServer(): McpServer {
         query: z.string().min(1).describe("比較に使う質問文"),
         title: z.string().optional().describe("比較記事のタイトル"),
         tags: z.array(z.string()).optional().describe("タグリスト"),
+        selectedDocIds: z
+          .array(z.number().int().positive())
+          .optional()
+          .describe("使用するWikipedia記事ID（最大2件）"),
       },
     },
-    async ({ query, title, tags = [] }) => {
+    async ({ query, title, tags = [], selectedDocIds = [] }) => {
       console.log(`[MCP] create_wiki_rag_comparison: "${query}"`);
       const filePath = await createRagComparisonDoc({
         query,
         title,
         tags,
-        createRagDoc: runPythonRAGDoc,
-        createWikiDoc: (keyword, wikiTags) => createDocFromWikipedia({ keyword, tags: wikiTags }),
+        createRagDoc: (q, t) => runPythonRAGDoc(q, t, selectedDocIds),
+        createWikiDoc: (keyword, wikiTags) =>
+          createDocFromWikipedia({ keyword, tags: wikiTags }),
         summarize: (prompt) => runPythonSummaryWithMode(prompt, "qa_non_rag"),
       });
       console.log(`[MCP] Generated comparison: ${filePath}`);
