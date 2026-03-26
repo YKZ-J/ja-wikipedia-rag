@@ -143,6 +143,7 @@ _JP_QUERY_CANONICAL_VARIANTS = {
     "首相": ["内閣総理大臣", "総理大臣", "内閣総理大臣の一覧"],
     "総理": ["内閣総理大臣", "総理大臣"],
     "狸小路": ["狸小路商店街", "札幌狸小路商店街"],
+    "コンサドーレ": ["北海道コンサドーレ札幌", "コンサドーレ札幌"],
 }
 
 _EMBED_CACHE_MAX = int(os.environ.get("RAG_EMBED_CACHE_MAX", "512"))
@@ -1191,6 +1192,29 @@ async def _retrieve_rag_docs(
     latin_terms = list(dict.fromkeys([token.lower() for token in _RE_LATIN_TOKEN.findall(query)]))
     subject_terms = set(re.findall(r"の([^の\s、。]{1,20})について", query))
 
+    def extract_parallel_subject_terms(text: str) -> list[str]:
+        cleaned = _RE_DETAIL_SPEC.sub("", text).strip("。 \t\n")
+        m = re.search(r"(.+?)について", cleaned)
+        base = m.group(1) if m else cleaned
+        pieces = re.split(r"(?:と|及び|および|・|/|／)", base)
+        terms: list[str] = []
+        seen: set[str] = set()
+        for piece in pieces:
+            token = piece.strip()
+            token = re.sub(r"^(?:\S+?の)", "", token)
+            token = re.sub(r"(?:を|は|が|について)$", "", token).strip()
+            if len(token) < 2:
+                continue
+            if token in _GENERIC_SECONDARY_QUERIES:
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            terms.append(token)
+        return terms[:4]
+
+    parallel_subject_terms = extract_parallel_subject_terms(query)
+
     # 速度最適化: 検索クエリ本数を最小化
     # - vector: 質問全文 1件
     # - title: 補助 1件（ただし観光/イベント等の意図語を優先）
@@ -1224,6 +1248,14 @@ async def _retrieve_rag_docs(
             if any(k in candidate for k in ("観光", "イベント", "祭", "祭り")):
                 vector_queries = [all_vector_queries[0], candidate]
                 break
+
+    if parallel_subject_terms:
+        for term in _expand_canonical_variants(parallel_subject_terms):
+            if term and term not in vector_queries:
+                vector_queries.append(term)
+            if len(vector_queries) >= 4:
+                break
+
     title_candidates = list(dict.fromkeys(all_title_queries))
 
     # ユーザー質問の「XのYについて」から Y を主題語として抽出し、
@@ -1236,6 +1268,7 @@ async def _retrieve_rag_docs(
     query_title_terms = [
         t for t in query_title_terms if t and t not in _GENERIC_SECONDARY_QUERIES and len(t) >= 2
     ]
+    query_title_terms = list(dict.fromkeys(query_title_terms + parallel_subject_terms))
     query_title_terms = _expand_canonical_variants(query_title_terms)
     title_candidates = list(dict.fromkeys(query_title_terms + title_candidates))
 
@@ -1252,7 +1285,10 @@ async def _retrieve_rag_docs(
         title_candidates = [q for q in all_vector_queries[1:] if len(q) <= 24][:2]
 
     location_heads = set(re.findall(r"([^の\s、。]{1,14})\u306e", query))
-    subject_terms_prioritized = _expand_canonical_variants(sorted(subject_terms))
+    parallel_subject_terms_prioritized = _expand_canonical_variants(parallel_subject_terms)
+    subject_terms_prioritized = _expand_canonical_variants(
+        list(dict.fromkeys(sorted(subject_terms) + parallel_subject_terms))
+    )
     subject_terms_expanded = set(subject_terms_prioritized)
 
     def title_priority(term: str) -> tuple[int, int]:
@@ -1290,6 +1326,9 @@ async def _retrieve_rag_docs(
     preferred_subject_candidates = [
         term for term in subject_terms_prioritized if term and term not in _GENERIC_SECONDARY_QUERIES
     ]
+    for term in parallel_subject_terms_prioritized:
+        if term and term not in _GENERIC_SECONDARY_QUERIES and term not in preferred_subject_candidates:
+            preferred_subject_candidates.append(term)
     merged_title_candidates = list(dict.fromkeys(preferred_subject_candidates + title_candidates))
 
     for candidate in merged_title_candidates:
@@ -1297,7 +1336,7 @@ async def _retrieve_rag_docs(
             continue
         title_queries.append(candidate)
 
-    title_queries = title_queries[:4] if latin_terms else title_queries[:2]
+    title_queries = title_queries[:4] if (latin_terms or parallel_subject_terms) else title_queries[:2]
     # アンカー語は検索に使わない分も保持して再ランキングで活用
     anchor_terms = [q for q in all_vector_queries[1:4] if q]
     for tq in title_queries:
@@ -1452,10 +1491,10 @@ async def _retrieve_rag_docs(
             if filtered_docs:
                 docs = filtered_docs
 
-    ranked_top10_docs = docs[:10]
+    ranked_top20_docs = docs[:20]
 
     # Gemma3 入力は最大 3 件（ランキング上位を優先）
-    return docs[:3], vector_queries, title_lists, extraction_mode, ranked_top10_docs
+    return docs[:3], vector_queries, title_lists, extraction_mode, ranked_top20_docs
 
 
 def _parse_selected_doc_ids(raw: str) -> list[int]:
@@ -1471,23 +1510,26 @@ def _parse_selected_doc_ids(raw: str) -> list[int]:
             continue
         seen.add(value)
         selected.append(value)
-        if len(selected) >= 2:
-            break
     return selected
 
 
 @mcp.tool()
 async def rag_rankings(query: str) -> str:
-    """質問に対するRAG検索ランキング上位10件をJSONで返す。"""
+    """質問に対するRAG検索ランキング上位20件をJSONで返す。"""
     db_url: str = get_db_url()
-    _, sub_queries, _, extraction_mode, ranked_top10_docs = await _retrieve_rag_docs(query, db_url)
+    _, sub_queries, _, extraction_mode, ranked_top20_docs = await _retrieve_rag_docs(query, db_url)
     payload = {
         "query": query,
         "extraction_mode": extraction_mode,
         "search_queries": sub_queries,
         "rankings": [
-            {"rank": idx, "id": int(doc["id"]), "title": str(doc["title"])}
-            for idx, doc in enumerate(ranked_top10_docs, start=1)
+            {
+                "rank": idx,
+                "id": int(doc["id"]),
+                "title": str(doc["title"]),
+                "content_length": len(str(doc.get("content", ""))),
+            }
+            for idx, doc in enumerate(ranked_top20_docs, start=1)
         ],
     }
     return json.dumps(payload, ensure_ascii=False)
@@ -1568,11 +1610,11 @@ async def rag_ask(
     import aiohttp
 
     db_url: str = get_db_url()
-    docs, sub_queries, title_lists, extraction_mode, ranked_top10_docs = await _retrieve_rag_docs(query, db_url)
+    docs, sub_queries, title_lists, extraction_mode, ranked_top20_docs = await _retrieve_rag_docs(query, db_url)
     selected_ids = _parse_selected_doc_ids(selected_doc_ids)
 
-    if selected_ids and ranked_top10_docs:
-        ranked_by_id = {int(doc["id"]): doc for doc in ranked_top10_docs}
+    if selected_ids and ranked_top20_docs:
+        ranked_by_id = {int(doc["id"]): doc for doc in ranked_top20_docs}
         selected_docs: list[dict] = []
         selected_seen: set[int] = set()
         for selected_id in selected_ids:
@@ -1586,18 +1628,11 @@ async def rag_ask(
 
         if selected_docs:
             docs = selected_docs
-            for fallback_doc in ranked_top10_docs:
-                fallback_id = int(fallback_doc["id"])
-                if fallback_id in selected_seen:
-                    continue
-                docs.append(fallback_doc)
-                if len(docs) >= 2:
-                    break
     print(f"[rag_ask] query_extraction_mode={extraction_mode}", file=sys.stderr)
 
     ranking_lines = [
         f"{index}. 【{doc['title']}】 (id={doc['id']})"
-        for index, doc in enumerate(ranked_top10_docs, start=1)
+        for index, doc in enumerate(ranked_top20_docs, start=1)
     ]
     ranking_text = "\n".join(ranking_lines) if ranking_lines else "（取得なし）"
 
@@ -1607,8 +1642,8 @@ async def rag_ask(
         sources_list_md = ""
         sources_body_md = ""
     else:
-        # 取得した Wikipedia は上位 2 件のみ Gemma3 入力へ含める
-        TARGET_DOCS_FOR_GEMMA = 2
+        # 通常は上位2件。ユーザー選択がある場合は選択順の件数をそのまま使う（最大20件）。
+        TARGET_DOCS_FOR_GEMMA = min(20, len(docs)) if selected_ids else 2
         docs = docs[:TARGET_DOCS_FOR_GEMMA]
         retrieved_docs_count = len(docs)
 

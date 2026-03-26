@@ -23,6 +23,7 @@ export type WikiRagRanking = {
   rank: number;
   id: number;
   title: string;
+  content_length: number;
 };
 
 export type WikiRagPreview = {
@@ -32,11 +33,7 @@ export type WikiRagPreview = {
   rankings: WikiRagRanking[];
 };
 
-export type SummaryMode =
-  | "non_rag_minimal"
-  | "search_summary"
-  | "qa_non_rag"
-  | "news_article";
+export type SummaryMode = "non_rag_minimal" | "search_summary" | "qa_non_rag" | "news_article";
 
 // ============================================================
 // Python コマンド / スクリプトパス解決
@@ -102,20 +99,13 @@ function resolveToolTimeout(name: string): number {
   return 60_000;
 }
 
-async function callLlmTool(
-  name: string,
-  args: Record<string, unknown>,
-): Promise<string> {
+async function callLlmTool(name: string, args: Record<string, unknown>): Promise<string> {
   return runInLlmQueue(async () => {
     const client = await getLlmClient();
     const timeout = resolveToolTimeout(name);
-    const result = (await client.callTool(
-      { name, arguments: args },
-      undefined,
-      {
-        timeout,
-      },
-    )) as CallToolResult;
+    const result = (await client.callTool({ name, arguments: args }, undefined, {
+      timeout,
+    })) as CallToolResult;
 
     if (result.isError) {
       const errText =
@@ -130,8 +120,7 @@ async function callLlmTool(
         ? (result.content[0] as { type: "text"; text: string }).text
         : "";
 
-    if (!text)
-      throw new Error("[llama-bridge] Python LLM returned empty output");
+    if (!text) throw new Error("[llama-bridge] Python LLM returned empty output");
     return text;
   });
 }
@@ -143,10 +132,7 @@ async function callLlmTool(
 /**
  * LLM でドキュメントを生成して Vault に保存し、ファイルパスを返す。
  */
-export async function runPythonLLM(
-  prompt: string,
-  options?: LlmCreateOptions,
-): Promise<string> {
+export async function runPythonLLM(prompt: string, options?: LlmCreateOptions): Promise<string> {
   return callLlmTool("generate_doc", {
     prompt,
     vault_dir: VAULT_PATH,
@@ -162,27 +148,20 @@ export async function runPythonSummary(prompt: string): Promise<string> {
   return callLlmTool("summarize", { prompt });
 }
 
-export async function runPythonSummaryWithMode(
-  prompt: string,
-  mode: SummaryMode,
-): Promise<string> {
+export async function runPythonSummaryWithMode(prompt: string, mode: SummaryMode): Promise<string> {
   return callLlmTool("summarize", { prompt, mode });
 }
 
 /**
  * Wikipedia RAG のランキング上位候補を返す。
  */
-export async function runPythonRAGRankings(
-  query: string,
-): Promise<WikiRagPreview> {
+export async function runPythonRAGRankings(query: string): Promise<WikiRagPreview> {
   const text = await callLlmTool("rag_rankings", { query });
   const parsed = JSON.parse(text) as WikiRagPreview;
   return {
     query: parsed.query,
     extraction_mode: parsed.extraction_mode,
-    search_queries: Array.isArray(parsed.search_queries)
-      ? parsed.search_queries
-      : [],
+    search_queries: Array.isArray(parsed.search_queries) ? parsed.search_queries : [],
     rankings: Array.isArray(parsed.rankings) ? parsed.rankings : [],
   };
 }

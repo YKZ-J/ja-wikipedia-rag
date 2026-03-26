@@ -222,7 +222,7 @@ function createMcpServer(): McpServer {
     "preview_wiki_rag_rankings",
     {
       title: "Wikipedia RAG ランキング取得",
-      description: "質問に対する検索ランキング上位10件を返す",
+      description: "質問に対する検索ランキング上位20件を返す",
       inputSchema: {
         query: z.string().min(1).describe("質問文字列"),
       },
@@ -246,7 +246,7 @@ function createMcpServer(): McpServer {
         selectedDocIds: z
           .array(z.number().int().positive())
           .optional()
-          .describe("使用するWikipedia記事ID（最大2件）"),
+          .describe("使用するWikipedia記事ID（0〜10件）"),
       },
     },
     async ({ query, tags = [], selectedDocIds = [] }) => {
@@ -270,7 +270,7 @@ function createMcpServer(): McpServer {
         selectedDocIds: z
           .array(z.number().int().positive())
           .optional()
-          .describe("使用するWikipedia記事ID（最大2件）"),
+          .describe("使用するWikipedia記事ID（0〜10件）"),
       },
     },
     async ({ query, title, tags = [], selectedDocIds = [] }) => {
