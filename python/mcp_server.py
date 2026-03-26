@@ -184,6 +184,13 @@ _LLAMA_PRESETS: dict[str, dict[str, float | int]] = {
         "top_k": 40,
         "repeat_penalty": 1.08,
     },
+    # compare-wiki 専用の軽量非RAG回答（フリーズ抑制）
+    "compare_non_rag_light": {
+        "max_tokens": 1200,
+        "temperature": 0.4,
+        "top_k": 30,
+        "repeat_penalty": 1.06,
+    },
     # ニュース記事生成向け（長文）
     "news_article": {
         "max_tokens": 8192,
@@ -194,12 +201,13 @@ _LLAMA_PRESETS: dict[str, dict[str, float | int]] = {
 }
 
 _SUMMARIZE_MODE_DEFAULT = "non_rag_minimal"
-_SUMMARIZE_MODE_MAP: dict[str, tuple[str, bool]] = {
-    # mode: (preset, wrap_non_rag_prompt)
-    "non_rag_minimal": ("non_rag_minimal", True),
-    "search_summary": ("search_summary", False),
-    "qa_non_rag": ("qa_non_rag", False),
-    "news_article": ("news_article", False),
+_SUMMARIZE_MODE_MAP: dict[str, tuple[str, bool, bool]] = {
+    # mode: (preset, wrap_non_rag_prompt, use_ollama)
+    "non_rag_minimal": ("non_rag_minimal", True, False),
+    "search_summary": ("search_summary", False, False),
+    "qa_non_rag": ("qa_non_rag", False, False),
+    "compare_non_rag_light": ("compare_non_rag_light", False, True),
+    "news_article": ("news_article", False, False),
 }
 
 
@@ -244,6 +252,34 @@ def _run_llama_with_preset(prompt: str, preset: str) -> str:
     )
     return str(result["choices"][0]["text"]).strip()
 
+
+def _run_ollama_summarize(prompt: str, preset: str) -> str:
+    """Ollama API 経由で要約する。llama-cpp モデルを使わないためメモリ増加を回避する。"""
+    import json as _json
+    import urllib.request
+
+    params = _LLAMA_PRESETS[preset]
+    max_tokens = int(params["max_tokens"])
+    data = _json.dumps({
+        "model": "gemma3:4b",
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "options": {
+            "num_ctx": max_tokens + 2048,
+            "num_predict": max_tokens,
+            "temperature": float(params["temperature"]),
+            "top_k": int(params["top_k"]),
+        },
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "http://localhost:11434/api/chat",
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        result = _json.loads(resp.read())
+    return result.get("message", {}).get("content", "").strip()
+
 # ============================================================
 # LLM シングルトン（遅延初期化）
 # ============================================================
@@ -265,13 +301,13 @@ def get_llm() -> Llama:
             raise ValueError(f"Not a valid GGUF file: {model_path}")
         _llm = Llama(
             model_path=str(model_path),
-            n_ctx=32768,
+            n_ctx=8192,
             n_threads=8,
             n_gpu_layers=-1,
             verbose=False,
             use_mmap=True,
             use_mlock=False,
-            n_batch=1024,
+            n_batch=512,
         )
     return _llm
 
@@ -522,8 +558,12 @@ def summarize(prompt: str, mode: str = _SUMMARIZE_MODE_DEFAULT) -> str:
         prompt: LLM に渡すプロンプト文字列
         mode:   プロンプト/パラメータのプリセット
     """
-    preset, wrap_prompt = _SUMMARIZE_MODE_MAP.get(mode, _SUMMARIZE_MODE_MAP[_SUMMARIZE_MODE_DEFAULT])
+    preset, wrap_prompt, use_ollama = _SUMMARIZE_MODE_MAP.get(
+        mode, _SUMMARIZE_MODE_MAP[_SUMMARIZE_MODE_DEFAULT]
+    )
     llm_prompt = _build_non_rag_prompt(prompt) if wrap_prompt else prompt
+    if use_ollama:
+        return _run_ollama_summarize(llm_prompt, preset)
     return _run_llama_with_preset(llm_prompt, preset)
 
 
@@ -1201,8 +1241,10 @@ async def _retrieve_rag_docs(
         seen: set[str] = set()
         for piece in pieces:
             token = piece.strip()
-            token = re.sub(r"^(?:\S+?の)", "", token)
+            token = _RE_DETAIL_SPEC.sub("", token)
+            token = re.sub(r"の違い(?:.*)$", "", token)
             token = re.sub(r"(?:を|は|が|について)$", "", token).strip()
+            token = re.sub(r"(?:を)?(?:説明|解説|比較|紹介|教えて)(?:して|してください)?$", "", token).strip()
             if len(token) < 2:
                 continue
             if token in _GENERIC_SECONDARY_QUERIES:
@@ -1598,6 +1640,7 @@ async def rag_ask(
     vault_dir: str = "",
     tags: str = "",
     selected_doc_ids: str = "",
+    mode: str = "default",
 ) -> str:
     """
     ローカル Wikipedia vectorDB を検索し Gemma3(Ollama) で回答を生成して Vault に保存する。
@@ -1637,13 +1680,26 @@ async def rag_ask(
     ranking_text = "\n".join(ranking_lines) if ranking_lines else "（取得なし）"
 
     # --- Ollama Gemma3 で回答生成（非同期） ---
+    context_stats_md = ""
+
     if not docs:
         answer = "関連する情報が見つかりませんでした。"
         sources_list_md = ""
         sources_body_md = ""
+        context_stats_md = (
+            "- 実使用コンテキスト長: 0文字\n"
+            "- Wikipedia本文合計: 0文字\n"
+            "- 参照記事数: 0\n"
+            "- num_ctx: 12000\n"
+            "- num_predict: 1400\n"
+            "- 記事別本文文字数:\n"
+            "  - （なし）"
+        )
     else:
-        # 通常は上位2件。ユーザー選択がある場合は選択順の件数をそのまま使う（最大20件）。
-        TARGET_DOCS_FOR_GEMMA = min(20, len(docs)) if selected_ids else 2
+        is_compare_mode = (mode or "").lower() == "compare"
+        compare_max_docs = max(1, int(os.environ.get("KB_COMPARE_RAG_MAX_DOCS", "4")))
+        # 通常は上位2件。compareでは選択順を尊重しつつ上限を低めにしてメモリピークを抑える。
+        TARGET_DOCS_FOR_GEMMA = min(compare_max_docs, len(docs)) if selected_ids else 2
         docs = docs[:TARGET_DOCS_FOR_GEMMA]
         retrieved_docs_count = len(docs)
 
@@ -1662,7 +1718,12 @@ async def rag_ask(
 
         # 入力コンテキストを安全側で制限する。
         # さらにAPI側で context overflow が発生した場合は、本文を段階的に縮小して再試行する。
-        MAX_CONTEXT_CHARS = int(os.environ.get("RAG_MAX_CONTEXT_CHARS", "14000"))
+        MAX_CONTEXT_CHARS = int(
+            os.environ.get(
+                "KB_COMPARE_RAG_MAX_CONTEXT_CHARS" if is_compare_mode else "RAG_MAX_CONTEXT_CHARS",
+                "9000" if is_compare_mode else "14000",
+            )
+        )
         MIN_CONTEXT_CHARS = int(os.environ.get("RAG_MIN_CONTEXT_CHARS", "1200"))
 
         base_sources: list[tuple[str, str]] = []
@@ -1732,8 +1793,8 @@ async def rag_ask(
                             "messages": rag_messages,
                             "stream": False,
                             "options": {
-                                "num_ctx": 20000,
-                                "num_predict": 2000,
+                                "num_ctx": 12000,
+                                "num_predict": 1400,
                                 "temperature": 0.08,
                                 "top_k": 15,
                                 "top_p": 0.85,
@@ -1797,8 +1858,27 @@ async def rag_ask(
         # 参照元タイトル一覧（Gemma3へ渡した順序）
         sources_list_md = "\n".join([f"- 【{title}】" for title, _ in context_sources])
         # 参照元Wikipedia本文（Gemma3へ実際に渡した本文をそのまま保存）
-        sources_body_md = "\n\n---\n\n".join(
-            [f"### 【{title}】\n\n{body}" for title, body in context_sources]
+        if is_compare_mode:
+            # compare-wiki は回答抽出が主目的のため、巨大な本文保存を省略してI/O負荷を下げる。
+            sources_body_md = "（compareモードのため省略）"
+        else:
+            sources_body_md = "\n\n---\n\n".join(
+                [f"### 【{title}】\n\n{body}" for title, body in context_sources]
+            )
+
+        source_char_lines = (
+            "\n".join([f"  - 【{title}】: {size:,}文字" for title, size in source_char_stats])
+            if source_char_stats
+            else "  - （なし）"
+        )
+        context_stats_md = (
+            f"- 実使用コンテキスト長: {total_ctx_chars:,}文字\n"
+            f"- Wikipedia本文合計: {total_ctx_chars:,}文字\n"
+            f"- 参照記事数: {included_docs_count}\n"
+            "- num_ctx: 12000\n"
+            "- num_predict: 1400\n"
+            "- 記事別本文文字数:\n"
+            f"{source_char_lines}"
         )
 
     # --- Vault に Markdown 保存 ---
@@ -1833,10 +1913,11 @@ async def rag_ask(
         f"# 質問\n{query}\n\n"
         f"# 回答\n{answer}\n\n"
         f"# 検索クエリ抽出モード\n{extraction_mode}\n\n"
-        f"# 検索ランキング (取得上位10件)\n{ranking_text}\n\n"
+        f"# 検索ランキング (取得上位20件)\n{ranking_text}\n\n"
         f"# 検索クエリ (実際に使用)\n"
         + "\n".join([f"- `{sq}`" for sq in sub_queries])
         + "\n\n"
+        f"# コンテキスト統計 (実測)\n{context_stats_md}\n\n"
         f"# 参照元 Wikipedia 一覧\n{sources_list_md}\n\n"
         f"# 参照元 Wikipedia 本文\n\n{sources_body_md}\n"
     )

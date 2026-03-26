@@ -33,7 +33,12 @@ export type WikiRagPreview = {
   rankings: WikiRagRanking[];
 };
 
-export type SummaryMode = "non_rag_minimal" | "search_summary" | "qa_non_rag" | "news_article";
+export type SummaryMode =
+  | "non_rag_minimal"
+  | "search_summary"
+  | "qa_non_rag"
+  | "compare_non_rag_light"
+  | "news_article";
 
 // ============================================================
 // Python コマンド / スクリプトパス解決
@@ -173,11 +178,13 @@ export async function runPythonRAGDoc(
   query: string,
   tags: string[] = [],
   selectedDocIds: number[] = [],
+  mode: "default" | "compare" = "default",
 ): Promise<string> {
   return callLlmTool("rag_ask", {
     query,
     vault_dir: VAULT_PATH,
     tags: tags.join(","),
     selected_doc_ids: selectedDocIds.join(","),
+    mode,
   });
 }

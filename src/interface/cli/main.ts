@@ -59,8 +59,7 @@ Note: MCP Server must be running:
   bun run src/interface/http/mcp-server.ts
 `;
 
-const MCP_SERVER_NOTE =
-  "\nIs MCP Server running?\n  bun run src/interface/http/mcp-server.ts";
+const MCP_SERVER_NOTE = "\nIs MCP Server running?\n  bun run src/interface/http/mcp-server.ts";
 
 function handleError(error: unknown): never {
   const message = error instanceof Error ? error.message : "unknown error";
@@ -101,9 +100,7 @@ function parseSelectedRanks(input: string, maxRank: number): number[] {
     .trim()
     .split(/[\s,]+/)
     .map((value) => Number.parseInt(value, 10))
-    .filter(
-      (value) => Number.isInteger(value) && value >= 1 && value <= maxRank,
-    );
+    .filter((value) => Number.isInteger(value) && value >= 1 && value <= maxRank);
 
   return Array.from(new Set(values));
 }
@@ -118,9 +115,7 @@ async function chooseWikiDocIds(query: string): Promise<number[]> {
   const rankings = preview.rankings.slice(0, 20);
   const maxRank = rankings.length;
   if (rankings.length === 0) {
-    console.log(
-      "[KB CLI] 検索ランキング候補が取得できなかったため、通常処理を続行します。",
-    );
+    console.log("[KB CLI] 検索ランキング候補が取得できなかったため、通常処理を続行します。");
     return [];
   }
 
@@ -128,9 +123,7 @@ async function chooseWikiDocIds(query: string): Promise<number[]> {
   console.log(preview.extractionMode);
   console.log(`\n# 検索ランキング (取得上位${maxRank}件)`);
   for (const item of rankings) {
-    console.log(
-      `${item.rank}. 【${item.title}】 (id=${item.id}, 本文${item.contentLength}文字)`,
-    );
+    console.log(`${item.rank}. 【${item.title}】 (id=${item.id}, 本文${item.contentLength}文字)`);
   }
   console.log("\n# 検索クエリ (実際に使用)");
   for (const q of preview.searchQueries) {
@@ -177,9 +170,7 @@ async function chooseWikiDocIds(query: string): Promise<number[]> {
         continue;
       }
 
-      console.log(
-        `選択記事: ${selected.map((item) => `【${item.title}】`).join(", ")}`,
-      );
+      console.log(`選択記事: ${selected.map((item) => `【${item.title}】`).join(", ")}`);
       return selected.map((item) => item.id);
     }
   } finally {
@@ -250,9 +241,7 @@ async function runSearch(args: string[], isAll: boolean): Promise<void> {
     console.error("✗ Error: query required");
     process.exit(1);
   }
-  console.log(
-    `[KB CLI] Searching${isAll ? " (all keywords)" : ""}: "${query}"`,
-  );
+  console.log(`[KB CLI] Searching${isAll ? " (all keywords)" : ""}: "${query}"`);
   const result = isAll ? await searchAllDocs(query) : await searchDocs(query);
   printSearchResult(result);
 }
@@ -302,9 +291,7 @@ async function runCreateWiki(args: string[]): Promise<void> {
     return;
   }
 
-  console.log(
-    `[KB CLI] Creating from Wikipedia (${keywords.length} keywords)...`,
-  );
+  console.log(`[KB CLI] Creating from Wikipedia (${keywords.length} keywords)...`);
   let failed = 0;
 
   for (const keyword of keywords) {
@@ -370,20 +357,12 @@ async function runCompareWiki(args: string[]): Promise<void> {
 
   const tags =
     titleFlagIndex >= 0
-      ? rest.filter(
-          (_, index) =>
-            index !== titleFlagIndex && index !== titleFlagIndex + 1,
-        )
+      ? rest.filter((_, index) => index !== titleFlagIndex && index !== titleFlagIndex + 1)
       : rest;
 
   console.log(`[KB CLI] Compare Wikipedia RAG: "${query}"`);
   const selectedDocIds = await chooseWikiDocIds(query);
-  const result = await createWikiRagComparison(
-    query,
-    title,
-    tags,
-    selectedDocIds,
-  );
+  const result = await createWikiRagComparison(query, title, tags, selectedDocIds);
   printFileResult(result);
 }
 
@@ -429,10 +408,7 @@ const COMMAND_HANDLERS: Record<string, () => Promise<void>> = {
   "compare-wiki": () => runCompareWiki(rest),
 };
 
-const handler =
-  command in COMMAND_HANDLERS
-    ? COMMAND_HANDLERS[command]
-    : () => runDefault(rawArgs);
+const handler = command in COMMAND_HANDLERS ? COMMAND_HANDLERS[command] : () => runDefault(rawArgs);
 
 try {
   await handler();

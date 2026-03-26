@@ -11,10 +11,7 @@ import { z } from "zod";
 import { createNewsArticle } from "../../application/use-cases/create-news";
 import { createRagComparisonDoc } from "../../application/use-cases/create-rag-comparison";
 import { createDocFromWikipedia } from "../../application/use-cases/create-wiki-doc";
-import {
-  searchAllDocs,
-  searchDocs,
-} from "../../application/use-cases/search-docs";
+import { searchAllDocs, searchDocs } from "../../application/use-cases/search-docs";
 import {
   runPythonLLM,
   runPythonRAGDoc,
@@ -74,8 +71,7 @@ function buildQuestionPrompt(
   matches: Array<{ summary?: string; body?: string }>,
   question: string,
 ): string {
-  let prompt =
-    "以下のドキュメント内容を参考に回答してください（タイトル・スラッグは除外）:\n\n";
+  let prompt = "以下のドキュメント内容を参考に回答してください（タイトル・スラッグは除外）:\n\n";
   for (const doc of matches.slice(0, 3)) {
     const parts = [doc.summary, doc.body].filter(Boolean);
     if (parts.length > 0) prompt += `${parts.join("\n")}\n\n`;
@@ -99,8 +95,7 @@ function createMcpServer(): McpServer {
     "create_doc",
     {
       title: "ドキュメント生成 (LLM)",
-      description:
-        "LLM で技術ドキュメントを生成して Vault に保存し、ファイルパスを返す",
+      description: "LLM で技術ドキュメントを生成して Vault に保存し、ファイルパスを返す",
       inputSchema: {
         title: z.string().min(1).describe("ドキュメントのタイトル"),
         tags: z.array(z.string()).optional().describe("タグリスト"),
@@ -119,8 +114,7 @@ function createMcpServer(): McpServer {
     "create_doc_wiki",
     {
       title: "Wikipedia ドキュメント生成",
-      description:
-        "Wikipedia から情報を取得して Vault に Markdown ドキュメントを保存する",
+      description: "Wikipedia から情報を取得して Vault に Markdown ドキュメントを保存する",
       inputSchema: {
         title: z.string().min(1).describe("Wikipedia 検索キーワード"),
         tags: z.array(z.string()).optional().describe("タグリスト"),
@@ -138,8 +132,7 @@ function createMcpServer(): McpServer {
     "create_news",
     {
       title: "ニュース記事生成",
-      description:
-        "ソースディレクトリのファイルをもとに LLM でニュース記事を生成する",
+      description: "ソースディレクトリのファイルをもとに LLM でニュース記事を生成する",
       inputSchema: {
         title: z.string().min(1).describe("記事のテーマタイトル"),
         tags: z.array(z.string()).optional().describe("タグリスト"),
@@ -206,9 +199,7 @@ function createMcpServer(): McpServer {
     async ({ query, question }) => {
       console.log(`[MCP] question_docs: "${query}"`);
       const searchResult = await searchAllDocs(query, async () => "");
-      const matches = Array.isArray(searchResult.matches)
-        ? searchResult.matches
-        : [];
+      const matches = Array.isArray(searchResult.matches) ? searchResult.matches : [];
       if (matches.length === 0) {
         return jsonText({ matches: [], answer: "" });
       }
@@ -246,7 +237,7 @@ function createMcpServer(): McpServer {
         selectedDocIds: z
           .array(z.number().int().positive())
           .optional()
-          .describe("使用するWikipedia記事ID（0〜10件）"),
+          .describe("使用するWikipedia記事ID（0〜20件）"),
       },
     },
     async ({ query, tags = [], selectedDocIds = [] }) => {
@@ -270,19 +261,23 @@ function createMcpServer(): McpServer {
         selectedDocIds: z
           .array(z.number().int().positive())
           .optional()
-          .describe("使用するWikipedia記事ID（0〜10件）"),
+          .describe("使用するWikipedia記事ID（0〜20件）"),
       },
     },
     async ({ query, title, tags = [], selectedDocIds = [] }) => {
       console.log(`[MCP] create_wiki_rag_comparison: "${query}"`);
+      const maxSelectedForCompare = Math.max(
+        1,
+        Number.parseInt(process.env.KB_COMPARE_WIKI_MAX_SELECTED_DOCS ?? "4", 10) || 4,
+      );
+      const selectedDocIdsForCompare = selectedDocIds.slice(0, maxSelectedForCompare);
       const filePath = await createRagComparisonDoc({
         query,
         title,
         tags,
-        createRagDoc: (q, t) => runPythonRAGDoc(q, t, selectedDocIds),
-        createWikiDoc: (keyword, wikiTags) =>
-          createDocFromWikipedia({ keyword, tags: wikiTags }),
-        summarize: (prompt) => runPythonSummaryWithMode(prompt, "qa_non_rag"),
+        createRagDoc: (q, t) => runPythonRAGDoc(q, t, selectedDocIdsForCompare, "compare"),
+        createWikiDoc: (keyword, wikiTags) => createDocFromWikipedia({ keyword, tags: wikiTags }),
+        summarize: (prompt) => runPythonSummaryWithMode(prompt, "compare_non_rag_light"),
       });
       console.log(`[MCP] Generated comparison: ${filePath}`);
       return jsonText({ file: filePath });

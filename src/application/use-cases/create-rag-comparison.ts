@@ -42,6 +42,14 @@ function dedupe(items: string[]): string[] {
   return Array.from(new Set(items.map((item) => item.trim()).filter(Boolean)));
 }
 
+function parseEnabledFlag(value: string | undefined, defaultValue: boolean): boolean {
+  if (!value) return defaultValue;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return defaultValue;
+}
+
 async function mapWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
@@ -241,14 +249,43 @@ export async function createRagComparisonDoc({
   const ragQueries = extractSearchQueries(ragMarkdown);
   const wikiTitles = extractWikipediaTitles(ragMarkdown);
 
+  const stageGapMs = Math.max(
+    0,
+    Number.parseInt(process.env.KB_COMPARE_STAGE_GAP_MS ?? "250", 10) || 250,
+  );
+  if (stageGapMs > 0) {
+    await new Promise<void>((resolve) => setTimeout(resolve, stageGapMs));
+  }
+
+  const generateSourceDocs = parseEnabledFlag(
+    process.env.KB_COMPARE_WIKI_GENERATE_SOURCE_DOCS,
+    true,
+  );
+
+  const maxSourceWikiDocs = Math.max(
+    1,
+    Number.parseInt(process.env.KB_COMPARE_WIKI_SOURCE_DOCS ?? "3", 10) || 3,
+  );
+  const sourceWikiConcurrency = Math.max(
+    1,
+    Number.parseInt(process.env.KB_COMPARE_WIKI_SOURCE_CONCURRENCY ?? "1", 10) || 1,
+  );
+  const limitedWikiTitles = wikiTitles.slice(0, maxSourceWikiDocs);
+
   const wikiSourceTags = dedupe(["wikipedia", "source", ...tags]);
-  const sourceSlugs = (
-    await mapWithConcurrency(wikiTitles, 3, async (wikiTitle) => {
-      const wikiPath = await createWikiDoc(wikiTitle, wikiSourceTags);
-      const wikiMarkdown = await readFile(wikiPath, "utf-8");
-      return extractSlugFromMarkdown(wikiMarkdown);
-    })
-  ).filter(Boolean);
+  const sourceSlugs = generateSourceDocs
+    ? (
+        await mapWithConcurrency(limitedWikiTitles, sourceWikiConcurrency, async (wikiTitle) => {
+          const wikiPath = await createWikiDoc(wikiTitle, wikiSourceTags);
+          const wikiMarkdown = await readFile(wikiPath, "utf-8");
+          return extractSlugFromMarkdown(wikiMarkdown);
+        })
+      ).filter(Boolean)
+    : [];
+
+  if (stageGapMs > 0) {
+    await new Promise<void>((resolve) => setTimeout(resolve, stageGapMs));
+  }
 
   const nonRagAnswer = normalizeWhitespace(await summarize(buildNonRagPrompt(trimmedQuery)));
 
