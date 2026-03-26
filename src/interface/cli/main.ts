@@ -108,14 +108,15 @@ function parseSelectedRanks(input: string, maxRank: number): number[] {
   return Array.from(new Set(values));
 }
 
-async function chooseTwoWikiDocIds(query: string): Promise<number[]> {
+async function chooseWikiDocIds(query: string): Promise<number[]> {
   const preview = await previewWikiRagRankings(query);
   if (!preview.ok) {
     console.error(`✗ Error: ${preview.error}`);
     process.exit(1);
   }
 
-  const rankings = preview.rankings.slice(0, 10);
+  const rankings = preview.rankings.slice(0, 20);
+  const maxRank = rankings.length;
   if (rankings.length === 0) {
     console.log(
       "[KB CLI] 検索ランキング候補が取得できなかったため、通常処理を続行します。",
@@ -125,9 +126,11 @@ async function chooseTwoWikiDocIds(query: string): Promise<number[]> {
 
   console.log("\n# 検索クエリ抽出モード");
   console.log(preview.extractionMode);
-  console.log("\n# 検索ランキング (取得上位10件)");
+  console.log(`\n# 検索ランキング (取得上位${maxRank}件)`);
   for (const item of rankings) {
-    console.log(`${item.rank}. 【${item.title}】 (id=${item.id})`);
+    console.log(
+      `${item.rank}. 【${item.title}】 (id=${item.id}, 本文${item.contentLength}文字)`,
+    );
   }
   console.log("\n# 検索クエリ (実際に使用)");
   for (const q of preview.searchQueries) {
@@ -135,8 +138,10 @@ async function chooseTwoWikiDocIds(query: string): Promise<number[]> {
   }
 
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    const fallback = rankings.slice(0, 2).map((item) => item.id);
-    console.log("\n[KB CLI] 非対話モードのため、上位2件を自動選択します。");
+    const fallback = rankings.map((item) => item.id);
+    console.log(
+      `\n[KB CLI] 非対話モードのため、上位${maxRank}件を自動選択します（先頭から順に使用）。`,
+    );
     return fallback;
   }
 
@@ -144,16 +149,22 @@ async function chooseTwoWikiDocIds(query: string): Promise<number[]> {
   try {
     while (true) {
       const answer = await rl.question(
-        "\n使用する記事の順位を2つ入力してください（例: 2 8 / Enterで上位2件）: ",
+        `\n使用する記事の順位を 0〜${maxRank} 件入力してください（例: 2 8 1 / 0 または Enter で選択なし）: `,
       );
 
       if (!answer.trim()) {
-        return rankings.slice(0, 2).map((item) => item.id);
+        return [];
       }
 
-      const selectedRanks = parseSelectedRanks(answer, rankings.length);
-      if (selectedRanks.length !== 2) {
-        console.log("順位は重複なしで2つ指定してください。");
+      if (answer.trim() === "0") {
+        return [];
+      }
+
+      const selectedRanks = parseSelectedRanks(answer, maxRank);
+      if (selectedRanks.length < 1 || selectedRanks.length > maxRank) {
+        console.log(
+          `順位は重複なしで 1〜${maxRank} 件を指定してください。選択なしは 0 を入力してください。`,
+        );
         continue;
       }
 
@@ -161,7 +172,7 @@ async function chooseTwoWikiDocIds(query: string): Promise<number[]> {
         .map((rank) => rankings.find((item) => item.rank === rank))
         .filter((item): item is WikiRagRanking => item !== undefined);
 
-      if (selected.length !== 2) {
+      if (selected.length !== selectedRanks.length) {
         console.log("指定した順位が不正です。もう一度入力してください。");
         continue;
       }
@@ -333,7 +344,7 @@ async function runAskWiki(args: string[]): Promise<void> {
     process.exit(1);
   }
   console.log(`[KB CLI] Wikipedia RAG: "${query}"`);
-  const selectedDocIds = await chooseTwoWikiDocIds(query);
+  const selectedDocIds = await chooseWikiDocIds(query);
   const result = await askWikiRag(query, tags, selectedDocIds);
   printFileResult(result);
 }
@@ -366,7 +377,7 @@ async function runCompareWiki(args: string[]): Promise<void> {
       : rest;
 
   console.log(`[KB CLI] Compare Wikipedia RAG: "${query}"`);
-  const selectedDocIds = await chooseTwoWikiDocIds(query);
+  const selectedDocIds = await chooseWikiDocIds(query);
   const result = await createWikiRagComparison(
     query,
     title,

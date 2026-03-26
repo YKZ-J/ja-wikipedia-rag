@@ -36,6 +36,7 @@ export type WikiRagRanking = {
   rank: number;
   id: number;
   title: string;
+  contentLength: number;
 };
 
 export type WikiRagPreviewResponse =
@@ -53,9 +54,7 @@ export type WikiRagPreviewResponse =
 const MCP_SERVER_URL = process.env.MCP_SERVER_URL || "http://localhost:3333";
 
 async function withClient<T>(fn: (client: Client) => Promise<T>): Promise<T> {
-  const transport = new StreamableHTTPClientTransport(
-    new URL(`${MCP_SERVER_URL}/mcp`),
-  );
+  const transport = new StreamableHTTPClientTransport(new URL(`${MCP_SERVER_URL}/mcp`));
   const client = new Client({ name: "kb-cli", version: "2.0.0" });
   await client.connect(transport);
   try {
@@ -117,10 +116,7 @@ export async function callMCP(prompt: string): Promise<FileResponse> {
   }
 }
 
-export async function createDoc(
-  title: string,
-  tags: string[] = [],
-): Promise<FileResponse> {
+export async function createDoc(title: string, tags: string[] = []): Promise<FileResponse> {
   try {
     const data = (await callTool("create_doc", { title, tags })) as {
       file: string;
@@ -134,10 +130,7 @@ export async function createDoc(
   }
 }
 
-export async function createWikiDoc(
-  title: string,
-  tags: string[] = [],
-): Promise<FileResponse> {
+export async function createWikiDoc(title: string, tags: string[] = []): Promise<FileResponse> {
   try {
     const data = (await callTool("create_doc_wiki", { title, tags })) as {
       file: string;
@@ -151,10 +144,7 @@ export async function createWikiDoc(
   }
 }
 
-export async function createNewsDoc(
-  title: string,
-  tags: string[] = [],
-): Promise<FileResponse> {
+export async function createNewsDoc(title: string, tags: string[] = []): Promise<FileResponse> {
   try {
     const data = (await callTool("create_news", { title, tags })) as {
       file: string;
@@ -206,10 +196,7 @@ export async function searchAllDocs(query: string): Promise<SearchResponse> {
   }
 }
 
-export async function questionDocs(
-  query: string,
-  question: string,
-): Promise<QuestionResponse> {
+export async function questionDocs(query: string, question: string): Promise<QuestionResponse> {
   try {
     const data = (await callTool("question_docs", { query, question })) as {
       matches: SearchDocResult[];
@@ -224,28 +211,39 @@ export async function questionDocs(
   }
 }
 
-export async function previewWikiRagRankings(
-  query: string,
-): Promise<WikiRagPreviewResponse> {
+export async function previewWikiRagRankings(query: string): Promise<WikiRagPreviewResponse> {
   try {
-    const data = (await callTool(
-      "preview_wiki_rag_rankings",
-      { query },
-      300_000,
-    )) as {
+    const data = (await callTool("preview_wiki_rag_rankings", { query }, 300_000)) as {
       query?: string;
       extraction_mode?: string;
       search_queries?: string[];
-      rankings?: WikiRagRanking[];
+      rankings?: Array<{
+        rank?: number;
+        id?: number;
+        title?: string;
+        content_length?: number;
+      }>;
     };
     return {
       ok: true,
       query: data.query ?? query,
       extractionMode: data.extraction_mode ?? "unknown",
-      searchQueries: Array.isArray(data.search_queries)
-        ? data.search_queries
+      searchQueries: Array.isArray(data.search_queries) ? data.search_queries : [],
+      rankings: Array.isArray(data.rankings)
+        ? data.rankings
+            .filter(
+              (item) =>
+                typeof item.rank === "number" &&
+                typeof item.id === "number" &&
+                typeof item.title === "string",
+            )
+            .map((item) => ({
+              rank: item.rank as number,
+              id: item.id as number,
+              title: item.title as string,
+              contentLength: typeof item.content_length === "number" ? item.content_length : 0,
+            }))
         : [],
-      rankings: Array.isArray(data.rankings) ? data.rankings : [],
     };
   } catch (error) {
     return {
@@ -261,11 +259,7 @@ export async function askWikiRag(
   selectedDocIds: number[] = [],
 ): Promise<FileResponse> {
   try {
-    const data = (await callTool(
-      "ask_wiki_rag",
-      { query, tags, selectedDocIds },
-      300_000,
-    )) as {
+    const data = (await callTool("ask_wiki_rag", { query, tags, selectedDocIds }, 300_000)) as {
       file: string;
     };
     return { ok: true, file: data.file };
@@ -284,9 +278,7 @@ export async function createWikiRagComparison(
   selectedDocIds: number[] = [],
 ): Promise<FileResponse> {
   try {
-    const timeoutMs = Number(
-      process.env.KB_COMPARE_WIKI_TIMEOUT_MS || "900000",
-    );
+    const timeoutMs = Number(process.env.KB_COMPARE_WIKI_TIMEOUT_MS || "900000");
     const data = (await callTool(
       "create_wiki_rag_comparison",
       {
