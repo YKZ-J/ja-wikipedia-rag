@@ -136,6 +136,7 @@ _LATIN_QUERY_VARIANTS = {
     "ai": ["AI", "人工知能"],
     "apple": ["Apple", "アップル"],
     "microsoft": ["Microsoft", "マイクロソフト"],
+    "red": ["Red", "Red Bull", "Red Bull GmbH", "レッドブル"],
 }
 
 # Wikipedia見出しでヒットしやすい正式名称への正規化辞書

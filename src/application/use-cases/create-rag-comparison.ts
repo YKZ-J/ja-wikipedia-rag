@@ -203,7 +203,7 @@ function createArticleBody(params: {
 生成した内容をChatGPTに評価させ、精度の違いを検証します。  
 ChatGPTへの指示は「下記の①と②の文章のファクトチェックをした上で回答精度の比較評価をしてださい」です。  
 
-モデル: gemma3:4b  
+モデル: gemma-3-1b-it-q4_0.gguf  
 wikipediaダンプ: jawiki-latest-pages-articles.xml.bz2 04-Mar-2026 01:54 4592085011  
 リポジトリ: https://github.com/YKZ-J/ja-wikipedia-rag
 

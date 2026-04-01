@@ -2,20 +2,24 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const DEFAULT_KB_DOCS_DIR =
-  process.env.KB_BLOG_SOURCE_PATH?.trim() || "/Users/ykz/programming/knowledge-base/docs";
+  process.env.KB_BLOG_SOURCE_PATH?.trim() ||
+  "/Users/ykz/programming/knowledge-base/docs";
 
 const SECTION_INJECTIONS = [
   {
     heading: "前回からの差分",
     sourcePath: "article-source/diff.md.md",
+    quote: false,
   },
   {
     heading: "実装の説明",
     sourcePath: "article-source/dairy-feat.md.md",
+    quote: false,
   },
   {
     heading: "ChatGPTによる精度比較評価",
     sourcePath: "article-source/ChatGPT-evaluation.md.md",
+    quote: true,
   },
 ] as const;
 
@@ -28,7 +32,11 @@ function quoteAllLines(text: string): string {
     .trimEnd();
 }
 
-function insertUnderHeading(markdown: string, heading: string, block: string): string {
+function insertUnderHeading(
+  markdown: string,
+  heading: string,
+  block: string,
+): string {
   const normalized = markdown.replace(/\r\n/g, "\n");
   const lines = normalized.split("\n");
   const headingLine = `## ${heading}`;
@@ -47,7 +55,13 @@ function insertUnderHeading(markdown: string, heading: string, block: string): s
   }
 
   const blockLines = block.split("\n");
-  const rebuilt = [...lines.slice(0, start + 1), "", ...blockLines, "", ...lines.slice(end)];
+  const rebuilt = [
+    ...lines.slice(0, start + 1),
+    "",
+    ...blockLines,
+    "",
+    ...lines.slice(end),
+  ];
   return rebuilt.join("\n");
 }
 
@@ -68,11 +82,14 @@ export async function arangeBlogDocument(fileName: string): Promise<string> {
   let markdown = await readFile(targetPath, "utf-8");
 
   const injections = await Promise.all(
-    SECTION_INJECTIONS.map(async ({ heading, sourcePath }) => {
-      const source = await readFile(path.join(docsDir, sourcePath), "utf-8");
+    SECTION_INJECTIONS.map(async (entry) => {
+      const source = await readFile(
+        path.join(docsDir, entry.sourcePath),
+        "utf-8",
+      );
       return {
-        heading,
-        block: quoteAllLines(source),
+        heading: entry.heading,
+        block: entry.quote ? quoteAllLines(source) : source,
       };
     }),
   );
