@@ -1,0 +1,8 @@
+timestamp_jst=20260425_180212
+database=postgres
+host=127.0.0.1
+port=54325
+user=supabase_admin
+table=public.documents_v2
+row_count=3888094
+fb0dc8514fd2694fcc39c24f8d84758b35bee39405f5cbbcf7b45c506320935a  /Users/ykz/programming/mcp-sever/backups/hnsw/documents_v2_hnsw_20260425_180212.dump

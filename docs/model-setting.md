@@ -6,20 +6,20 @@
 
 ```bash
 MODEL_DIR=/Users/ykz/programming/models
-MODEL_PATH_GEMMA_1B=${MODEL_DIR}/gemma-3-1b-it-q4_0.gguf
-MODEL_PATH_GEMMA_4B=${MODEL_DIR}/gemma-3-4b-it-qat-q4_0.gguf
+MODEL_PATH_GEMMA_2B=${MODEL_DIR}/gemma-2b-it-q4_0.gguf
+MODEL_PATH_GEMMA_4B=${MODEL_DIR}/gemma-4b-it-q4_0.gguf
 
-# 既定: 1B  を使用
-MODEL_PATH=${MODEL_PATH_GEMMA_1B}
+# 既定: 2B を使用
+MODEL_PATH=${MODEL_PATH_GEMMA_2B}
 ```
 
-### 切り替え方（1B ↔ 4B）
+### 切り替え方（2B ↔ 4B）
 
 `MODEL_PATH` の右辺を変更するだけで切り替えできます。
 
 ```bash
-# 1B を使う
-MODEL_PATH=${MODEL_PATH_GEMMA_1B}
+# 2B を使う
+MODEL_PATH=${MODEL_PATH_GEMMA_2B}
 
 # 4B を使う
 MODEL_PATH=${MODEL_PATH_GEMMA_4B}
@@ -38,10 +38,10 @@ bun run src/interface/http/mcp-server.ts
 
 ### モデル配置場所
 
-1B モデル:
+2B モデル:
 
-`/Users/ykz/programming/models/gemma-3-1b-it-q4_0.gguf`
+`/Users/ykz/programming/models/gemma-2b-it-q4_0.gguf`
 
 4B モデル:
 
-`/Users/ykz/programming/models/gemma-3-4b-it-qat-q4_0.gguf`
+`/Users/ykz/programming/models/gemma-4b-it-q4_0.gguf`

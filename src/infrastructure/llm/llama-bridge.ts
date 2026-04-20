@@ -33,6 +33,52 @@ export type WikiRagPreview = {
   rankings: WikiRagRanking[];
 };
 
+export type WikiRagReportDoc = {
+  rank: number;
+  id: number;
+  title: string;
+  content: string;
+  content_length: number;
+};
+
+export type WikiRagReport = {
+  query: string;
+  top_k: number;
+  generated_at: string;
+  extraction_mode: string;
+  search_queries: string[];
+  search_time_ms: number;
+  answer_time_ms: number;
+  total_time_ms: number;
+  answer_error: string;
+  answer: string;
+  runtime_parameters: {
+    model_path: string;
+    llm_preset: string;
+    max_context_chars: number;
+    content_preview_chars: number;
+    effective_top_k: number;
+    llm_params: {
+      max_tokens: number;
+      temperature: number;
+      top_k: number;
+      repeat_penalty: number;
+    };
+  };
+  context_chunk_sizes: Array<{
+    rank: number;
+    title: string;
+    chunk_chars: number;
+  }>;
+  top_docs: WikiRagReportDoc[];
+  ranked_sources: Array<{
+    rank: number;
+    id: number;
+    title: string;
+    content_length: number;
+  }>;
+};
+
 export type SummaryMode =
   | "non_rag_minimal"
   | "search_summary"
@@ -92,6 +138,7 @@ function runInLlmQueue<T>(task: () => Promise<T>): Promise<T> {
 // compare-wiki では summarize も長文生成になり得るため長めに設定する。
 const TOOL_TIMEOUT_MS: Record<string, number> = {
   rag_ask: Number(process.env.KB_RAG_ASK_TIMEOUT_MS || "300000"),
+  rag_answer_report: Number(process.env.KB_RAG_REPORT_TIMEOUT_MS || "900000"),
   summarize: Number(process.env.KB_SUMMARIZE_TIMEOUT_MS || "300000"),
   generate_doc: Number(process.env.KB_GENERATE_DOC_TIMEOUT_MS || "180000"),
 };
@@ -169,6 +216,11 @@ export async function runPythonRAGRankings(query: string): Promise<WikiRagPrevie
     search_queries: Array.isArray(parsed.search_queries) ? parsed.search_queries : [],
     rankings: Array.isArray(parsed.rankings) ? parsed.rankings : [],
   };
+}
+
+export async function runPythonRAGReport(query: string, topK = 3): Promise<WikiRagReport> {
+  const text = await callLlmTool("rag_answer_report", { query, top_k: topK });
+  return JSON.parse(text) as WikiRagReport;
 }
 
 /**

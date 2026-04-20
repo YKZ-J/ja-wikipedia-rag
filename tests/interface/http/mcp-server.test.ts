@@ -144,10 +144,10 @@ describe("MCP Server — プロトコル", () => {
     const tools: Array<{ name: string }> = body.result?.tools ?? [];
     const names = tools.map((t) => t.name);
 
-    expect(names).toContain("create_doc");
-    expect(names).toContain("search_docs");
-    expect(names).toContain("search_all_docs");
-    expect(names).toContain("question_docs");
+    expect(names).toContain("create_doc_wiki");
+    expect(names).toContain("ask_wiki_rag");
+    expect(names).toContain("ask_wiki_rag_report");
+    expect(names).toContain("create_wiki_rag_comparison");
     expect(names).toContain("generate_from_prompt");
   });
 

@@ -32,7 +32,7 @@ Started supabase local development setup.
          API URL: http://localhost:54324
      GraphQL URL: http://localhost:54324/graphql/v1
   S3 Storage URL: https://...
-          DB URL: postgresql://postgres:postgres@127.0.0.1:54325/postgres
+          DB URL: postgresql://postgres:<db-password>@127.0.0.1:54325/postgres
       Studio URL: http://localhost:54323
     Inbucket URL: http://localhost:54324/mail/api
       JWT secret: super-secret-jwt-token...

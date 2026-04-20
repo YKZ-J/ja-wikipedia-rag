@@ -8,76 +8,19 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
-import { createNewsArticle } from "../../application/use-cases/create-news";
 import { createRagComparisonDoc } from "../../application/use-cases/create-rag-comparison";
 import { createDocFromWikipedia } from "../../application/use-cases/create-wiki-doc";
-import { searchAllDocs, searchDocs } from "../../application/use-cases/search-docs";
 import {
   runPythonLLM,
   runPythonRAGDoc,
   runPythonRAGRankings,
+  runPythonRAGReport,
   runPythonSummaryWithMode,
 } from "../../infrastructure/llm/llama-bridge";
-import { getTokyoDateString } from "../../shared/lib/date";
 
 // ============================================================
 // 補助関数
 // ============================================================
-function buildCreatePrompt(title: string, tags: string[]): string {
-  const tagList = tags.length > 0 ? tags.join(", ") : "general";
-  const today = getTokyoDateString();
-
-  return `以下のタイトルで技術ドキュメントをMarkdown形式で作成してください。
-
-タイトル: ${title}
-タグ: ${tagList}
-
-必ず以下の形式で出力してください。バッククォート3つのコードブロックは絶対に使わないでください:
-
----
-title: "${title}"
-tags: [${tagList}]
-created: "${today}"
-updated: "${today}"
-summary: "具体的な概要を1-2文で書く"
-image: "https://ytzmpefdjnd1ueff.public.blob.vercel-storage.com/blog.webp"
-type: "diary"
-isDraft: "true"
----
-
-# 概要
-概要は200-300文字で、文末が途切れないように書く（summaryフィールドと同じ内容）。
-
-# 詳細
-詳細な技術説明を300-500文字程度で記述し、最後に具体的なライブラリ名と用途を箇条書きで5-8項目入れる（各項目は1-2文）。
-
-# 関連
-- [関連リンク1](URL)
-- [関連リンク2](URL)
-
-重要事項:
-- Markdownコードブロック記号は絶対に使わない
-- frontmatterの各フィールドには実際の値を入れる
-- id と slug は自動生成されるため出力しない
-- 見出しは # 概要 / # 詳細 / # 関連 の3つのみ
-- summaryには具体的な概要文を書く（太字記号なし）
-- 本文には意味のある技術的内容を書く
-- プレースホルダーは使用しない
-- 文末が途中で切れないようにする
-`;
-}
-
-function buildQuestionPrompt(
-  matches: Array<{ summary?: string; body?: string }>,
-  question: string,
-): string {
-  let prompt = "以下のドキュメント内容を参考に回答してください（タイトル・スラッグは除外）:\n\n";
-  for (const doc of matches.slice(0, 3)) {
-    const parts = [doc.summary, doc.body].filter(Boolean);
-    if (parts.length > 0) prompt += `${parts.join("\n")}\n\n`;
-  }
-  return `${prompt}質問: ${question}\n答え:`;
-}
 
 function jsonText(data: unknown): {
   content: [{ type: "text"; text: string }];
@@ -90,25 +33,6 @@ function jsonText(data: unknown): {
 // ============================================================
 function createMcpServer(): McpServer {
   const server = new McpServer({ name: "kb-mcp-server", version: "2.0.0" });
-
-  server.registerTool(
-    "create_doc",
-    {
-      title: "ドキュメント生成 (LLM)",
-      description: "LLM で技術ドキュメントを生成して Vault に保存し、ファイルパスを返す",
-      inputSchema: {
-        title: z.string().min(1).describe("ドキュメントのタイトル"),
-        tags: z.array(z.string()).optional().describe("タグリスト"),
-      },
-    },
-    async ({ title, tags = [] }) => {
-      console.log(`[MCP] create_doc: "${title}"`);
-      const prompt = buildCreatePrompt(title, tags);
-      const filePath = await runPythonLLM(prompt, { title, tags });
-      console.log(`[MCP] Generated: ${filePath}`);
-      return jsonText({ file: filePath });
-    },
-  );
 
   server.registerTool(
     "create_doc_wiki",
@@ -125,87 +49,6 @@ function createMcpServer(): McpServer {
       const filePath = await createDocFromWikipedia({ keyword: title, tags });
       console.log(`[MCP] Generated: ${filePath}`);
       return jsonText({ file: filePath });
-    },
-  );
-
-  server.registerTool(
-    "create_news",
-    {
-      title: "ニュース記事生成",
-      description: "ソースディレクトリのファイルをもとに LLM でニュース記事を生成する",
-      inputSchema: {
-        title: z.string().min(1).describe("記事のテーマタイトル"),
-        tags: z.array(z.string()).optional().describe("タグリスト"),
-      },
-    },
-    async ({ title, tags = [] }) => {
-      console.log(`[MCP] create_news: "${title}"`);
-      const filePath = await createNewsArticle({
-        title,
-        tags,
-        summarize: (prompt) => runPythonSummaryWithMode(prompt, "news_article"),
-      });
-      console.log(`[MCP] Generated news: ${filePath}`);
-      return jsonText({ file: filePath });
-    },
-  );
-
-  server.registerTool(
-    "search_docs",
-    {
-      title: "ドキュメント検索",
-      description: "Vault をフルテキスト検索し、上位マッチと LLM 要約を返す",
-      inputSchema: {
-        query: z.string().min(1).describe("検索クエリ"),
-      },
-    },
-    async ({ query }) => {
-      console.log(`[MCP] search_docs: "${query}"`);
-      const result = await searchDocs(query, (prompt) =>
-        runPythonSummaryWithMode(prompt, "search_summary"),
-      );
-      return jsonText(result);
-    },
-  );
-
-  server.registerTool(
-    "search_all_docs",
-    {
-      title: "ドキュメント全キーワード検索",
-      description: "Vault をすべてのキーワードが含まれるドキュメントで検索する",
-      inputSchema: {
-        query: z.string().min(1).describe("スペース区切りのキーワード"),
-      },
-    },
-    async ({ query }) => {
-      console.log(`[MCP] search_all_docs: "${query}"`);
-      const result = await searchAllDocs(query, (prompt) =>
-        runPythonSummaryWithMode(prompt, "search_summary"),
-      );
-      return jsonText(result);
-    },
-  );
-
-  server.registerTool(
-    "question_docs",
-    {
-      title: "ドキュメント Q&A",
-      description: "関連ドキュメントを検索して LLM で質問に回答する",
-      inputSchema: {
-        query: z.string().min(1).describe("関連ドキュメントを探すクエリ"),
-        question: z.string().min(1).describe("LLM に回答させる質問"),
-      },
-    },
-    async ({ query, question }) => {
-      console.log(`[MCP] question_docs: "${query}"`);
-      const searchResult = await searchAllDocs(query, async () => "");
-      const matches = Array.isArray(searchResult.matches) ? searchResult.matches : [];
-      if (matches.length === 0) {
-        return jsonText({ matches: [], answer: "" });
-      }
-      const llmPrompt = buildQuestionPrompt(matches, question);
-      const answer = await runPythonSummaryWithMode(llmPrompt, "qa_non_rag");
-      return jsonText({ matches, answer });
     },
   );
 
@@ -245,6 +88,24 @@ function createMcpServer(): McpServer {
       const filePath = await runPythonRAGDoc(query, tags, selectedDocIds);
       console.log(`[MCP] Generated: ${filePath}`);
       return jsonText({ file: filePath });
+    },
+  );
+
+  server.registerTool(
+    "ask_wiki_rag_report",
+    {
+      title: "Wikipedia RAG 回答レポート生成",
+      description:
+        "ローカル Wikipedia vectorDB を検索し、回答と検索/回答時間やtop_k取得内容をJSONで返す",
+      inputSchema: {
+        query: z.string().min(1).describe("質問文字列"),
+        topK: z.number().int().min(1).max(3).optional().describe("取得件数（固定3推奨）"),
+      },
+    },
+    async ({ query, topK = 3 }) => {
+      console.log(`[MCP] ask_wiki_rag_report: "${query}" topK=${topK}`);
+      const report = await runPythonRAGReport(query, Math.min(3, Math.max(1, topK)));
+      return jsonText(report);
     },
   );
 

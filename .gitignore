@@ -4,6 +4,8 @@ dist/
 .env.local
 .env.*.local
 *.log
+*.pid
+logs/
 .DS_Store
 .github
 /.agents/
@@ -21,4 +23,9 @@ jawiki-latest-pages-articles.xml.bz2
 # Parquet バックアップ (大容量)
 parquet_output_*.tar.gz
 parquet_output_*_part_*
+parquet_output/*.parquet*
 
+.cache/
+**/.cache/
+
+backups/

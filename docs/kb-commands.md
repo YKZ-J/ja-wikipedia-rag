@@ -1,8 +1,6 @@
 # kb コマンド一覧
 
-MCP Server (`bun run src/interface/http/mcp-server.ts`) を起動した状態で使用する。
-
----
+MCP Server (bun run src/interface/http/mcp-server.ts) を起動した状態で使用します。
 
 ## 基本構文
 
@@ -10,64 +8,35 @@ MCP Server (`bun run src/interface/http/mcp-server.ts`) を起動した状態で
 kb <command> "<引数>" [タグ...]
 ```
 
----
+## 運用対象コマンド
 
-## コマンド一覧
+本リポジトリで運用するコマンドは以下です。
+
+- kb create-wiki
+- kb ask-wiki
+- kb ask-wiki-report
+- kb compare-wiki
+- kb arange-blog
 
 ## コマンド別 Prompt / LLM Parameters
 
-以下は、各 `kb` コマンドで実際に使われる Prompt と LLM パラメータの対応です。
-
-| CLIコマンド         | 内部ツール/経路                                                                   | Prompt                                                                                                                                  | LLMパラメータ                                                                                                                                                                           |
-| ------------------- | --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kb "<プロンプト>"` | `generate_from_prompt` → Python `generate_doc`                                    | CLI入力をそのまま使用                                                                                                                   | preset `doc_generation`: `max_tokens=8192`, `temperature=0.7`, `top_k=50`, `repeat_penalty=1.1`                                                                                         |
-| `kb create`         | `create_doc` → `buildCreatePrompt()` → Python `generate_doc`                      | タイトル/タグを埋め込んだ固定テンプレート                                                                                               | preset `doc_generation`: `max_tokens=8192`, `temperature=0.7`, `top_k=50`, `repeat_penalty=1.1`                                                                                         |
-| `kb create-wiki`    | `create_doc_wiki` → `createDocFromWikipedia()`                                    | Wikipedia APIベース（LLM未使用）                                                                                                        | なし                                                                                                                                                                                    |
-| `kb create-news`    | `create_news` → `createNewsArticle()` → Python `summarize(mode="news_article")`   | `docs/news-writter-prompt.md` + 追加指示 + ソース本文                                                                                   | preset `news_article`: `max_tokens=8192`, `temperature=0.7`, `top_k=50`, `repeat_penalty=1.1`                                                                                           |
-| `kb search`         | `search_docs` → Python `summarize(mode="search_summary")`                         | 検索結果上位を要約する固定テンプレート                                                                                                  | preset `search_summary`: `max_tokens=700`, `temperature=0.2`, `top_k=20`, `repeat_penalty=1.05`                                                                                         |
-| `kb search-all`     | `search_all_docs` → Python `summarize(mode="search_summary")`                     | 検索結果上位を要約する固定テンプレート                                                                                                  | preset `search_summary`: `max_tokens=700`, `temperature=0.2`, `top_k=20`, `repeat_penalty=1.05`                                                                                         |
-| `kb question`       | `question_docs` → `buildQuestionPrompt()` → Python `summarize(mode="qa_non_rag")` | 関連ドキュメント抜粋 + 質問を埋め込むテンプレート                                                                                       | preset `qa_non_rag`: `max_tokens=2600`, `temperature=0.5`, `top_k=40`, `repeat_penalty=1.08`                                                                                            |
-| `kb ask-wiki`       | `ask_wiki_rag` → Python `rag_ask`                                                 | 2段階: 1) 質問整形Prompt 2) RAG回答Prompt (`_build_rag_prompt`)                                                                         | 1) 質問整形(Ollama): `temperature=0.0`, `num_predict=128` 2) RAG回答(Ollama): `num_ctx=30000`, `num_predict=10000`, `temperature=0.15`, `top_k=15`, `top_p=0.85`, `repeat_penalty=1.03` |
-| `kb arange-blog`    | `arange_blog` → `src/application/use-cases/arange-blog.ts`                        | 指定記事の所定3箇所へ外部Markdownを引用（行頭`>`）で挿入するユーティリティ                                                              | なし                                                                                                                                                                                    |
-| `kb compare-wiki`   | `create_wiki_rag_comparison`                                                      | **RAGあり**: `ask-wiki` と同一。**RAGなし**: `buildNonRagPrompt()`（一般知識のみで回答）を Python `summarize(mode="qa_non_rag")` へ入力 | **RAGあり**: `ask-wiki` と同一（質問整形 + RAG回答）。**RAGなし**: preset `qa_non_rag`: `max_tokens=2600`, `temperature=0.5`, `top_k=40`, `repeat_penalty=1.08`                         |
+| CLIコマンド        | 内部ツール/経路                                        | Prompt                                                                                          | LLMパラメータ                                        |
+| ------------------ | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| kb create-wiki     | create_doc_wiki → createDocFromWikipedia()             | Wikipedia APIベース（LLM未使用）                                                                | なし                                                 |
+| kb ask-wiki        | ask_wiki_rag → Python rag_ask                          | ask-wiki-report と同一の検索条件（rule_based_fast + vector_query_limit=1 既定）で RAG回答を生成 | preset qa_rag（既定）                                |
+| kb ask-wiki-report | ask_wiki_rag_report → Python rag_answer_report         | RAG検索 + 回答生成の実測レポートを生成し、CLIがMarkdownへ保存                                   | 固定 top_k=3、timings/runtime/context を出力         |
+| kb compare-wiki    | create_wiki_rag_comparison                             | RAGあり: ask-wiki と同一。RAGなし: qa_non_rag で比較出力生成                                    | RAGあり: ask-wiki と同一。RAGなし: preset qa_non_rag |
+| kb arange-blog     | arange_blog → src/application/use-cases/arange-blog.ts | 指定記事の所定箇所へ外部Markdownを引用挿入                                                      | なし                                                 |
 
 補足:
 
-- Python 側 `summarize` は `mode` ごとに Prompt ラップ有無とパラメータを切り替える。
-- `ask-wiki` / `compare-wiki(RAGあり)` の最終回答は `summarize` を使わず、`rag_ask` 内の RAG 専用 Prompt を使用する。
+- ask-wiki と ask-wiki-report は同じ検索条件を使います。
+- ask-wiki-report はレポート用途のため top_k=3 固定です。
 
-### `kb "<プロンプト>"` — LLM ドキュメント生成（デフォルト）
+### kb create-wiki "<キーワード>" [タグ...]
 
-任意のプロンプトを LLM に渡して Markdown ドキュメントを Vault に保存する。
-
-```bash
-kb "Next.js 16 の最新機能をまとめて"
-kb "TypeScript の型安全性について整理"
-```
-
-出力例:
-
-```
-✓ Generated: /path/to/vault/next-js-16-a1b2.md
-```
-
----
-
-### `kb create "<タイトル>" [タグ...]` — タイトル指定でドキュメント生成
-
-タイトルとタグを指定して LLM で技術ドキュメントを生成する。
-
-```bash
-kb create "Next.js 16 最新機能" nextjs web
-kb create "Bun ランタイム入門" bun javascript
-```
-
----
-
-### `kb create-wiki "<キーワード>" [タグ...]` — Wikipedia ドキュメント生成
-
-Wikipedia API からキーワードの情報を取得して Markdown に保存する。  
-**カンマ区切りまたはスペース区切りで複数キーワードを一括処理**できる。
+Wikipedia API からキーワード情報を取得して Markdown に保存します。
+カンマ区切りまたはスペース区切りで複数キーワードを一括処理できます。
 
 ```bash
 kb create-wiki "TypeScript"
@@ -75,33 +44,9 @@ kb create-wiki "TypeScript, Rust, Go" programming language
 kb create-wiki "北海道 東京 大阪"
 ```
 
-複数キーワード時の出力例:
+### kb ask-wiki "<質問>" [タグ...]
 
-```
-[KB CLI] Creating from Wikipedia (3 keywords)...
-- keyword: "北海道"
-  ✓ Generated: /path/to/vault/ab12-hokkaido.md
-- keyword: "東京"
-  ✓ Generated: /path/to/vault/cd34-tokyo.md
-- keyword: "大阪"
-  ✓ Generated: /path/to/vault/ef56-osaka.md
-```
-
----
-
-### `kb create-news "<テーマ>" [タグ...]` — ニュース記事生成
-
-ソースディレクトリのファイルをもとに LLM でニュース記事を生成する。
-
-```bash
-kb create-news "TypeScript 最新動向" typescript news
-```
-
----
-
-### `kb ask-wiki "<質問>" [タグ...]` — Wikipedia RAG 回答生成
-
-ローカル Wikipedia ベクターDB を検索し、Gemma3 で回答を生成して Vault に保存する。
+ローカル Wikipedia ベクターDB を検索し、回答を生成して Vault に保存します。
 
 ```bash
 kb ask-wiki "富士山の標高は？"
@@ -109,141 +54,56 @@ kb ask-wiki "北海道の観光名所と春のイベントを1500文字程度で
 kb ask-wiki "アイヌ民族の歴史と文化について" wikipedia history
 ```
 
-出力例:
+### kb ask-wiki-report "<質問>"
 
+ask-wiki と同じ検索を実行し、top_k=3 固定で取得内容と実測時間を Markdown に保存します。
+
+```bash
+kb ask-wiki-report "富士山の標高は？"
 ```
-✓ Generated: /path/to/vault/ab12-hokkaido-kanko.md
-```
 
-生成ファイルには取得した Wikipedia 記事（最大10件）を参考に生成された回答と出典一覧が含まれる。
+既定の保存先: backups/rag-volume-data/reports/
 
----
+### kb compare-wiki "<質問>" [--title "<比較記事タイトル>"] [タグ...]
 
-### `kb compare-wiki "<質問>" [--title "<比較記事タイトル>"] [タグ...]` — RAGあり/なしの比較記事生成
-
-`compare-wiki` は以下の流れで比較記事（Markdown）を自動生成します。
-
-1. `ask-wiki` 相当の Wikipedia RAG 回答を生成（最大10件の参照を利用）
-2. RAGあり出力の回答本文・使用した検索クエリ・参照元 Wikipedia タイトル一覧を抽出
-3. 抽出した参照元タイトルごとに `kb create-wiki` を実行して個別の Wikipedia ソース記事（slug）を作成
-4. 同じ質問を RAG なしで LLM に投げて比較用の出力を取得
-5. 比較記事の frontmatter に `sources` として作成した slug を埋め、RAGあり／RAGなしの出力を両方含む Markdown を Vault に保存
-
-オプション:
-
-- `--title "<比較記事タイトル>"` : 生成する比較記事のタイトルを明示的に指定（省略時は自動タイトル）
-- `タグ...` : 比較記事に付与するタグ（省略可）
-
-例:
+RAGあり/なしを比較した記事を生成します。
 
 ```bash
 kb compare-wiki "アイヌ民族について教えて。世界の少数民族との共通点も教えて。3000文字程度でできるだけ詳しく" --title "RAGで変わるローカルLLMの出力精度比較検証" rag llm
-
-# シンプル実行（タイトル省略、タグなし）
 kb compare-wiki "東京都の観光名と歴史を1500文字で説明して"
 ```
 
-生成される比較記事の frontmatter 例（`sources` に `create-wiki` で生成した slug が入る）:
+### kb arange-blog "<slug or filename>"
 
-```yaml
----
-title: "RAGで変わるローカルLLMの出力精度比較検証"
-slug: "a1b2-rag-local-llm-comparison"
-tags:
-  - ai
-  - rag
-  - llm
-sources:
-  - 3f4a-wikipedia-source
-  - 7c2d-wikipedia-source
-created: 2026-03-21
-updated: 2026-03-21
-summary: "RAGあり/なしの出力を比較した自動生成レポート"
-image: "https://.../blog.webp"
-type: tech
-isDraft: "false"
----
-```
-
-追記: `compare-wiki` の RAGあり出力では、内部で使用した抽出モード（`gemma_json` または `rule_based_fallback`）が生成ファイルに `extraction_mode` として記録されます。さらに、RAG検索で取得した上位10件のランキング（タイトル・ソースslug・スコア/類似度）を `ranked_sources` セクションとしてフロントマターまたは本文内に出力します。これにより、どの抽出モードでどの候補が選ばれたか、順位とスコアを明示的に確認できます。
-
-注意:
-
-- `compare-wiki` は内部で複数の外部API呼び出し／LLM処理を行うため実行に時間がかかる場合があります。MCP サーバーが稼働中であることを確認してください。
-- Vault 出力先は `VAULT_PATH` を参照します（環境変数が未設定だとエラーになります）。
-
-### `kb arange-blog "<slug or filename>"` — 既存記事へ外部Markdownを引用挿入
-
-指定した記事の所定の3箇所に、外部Markdownソースを行頭 `>` の引用形式で挿入します（実装済み）。通常は対象記事の `sources` フロントマターを参照して外部ファイルを解決し、見出し箇所を探索して挿入を行います。
-
-例:
+指定記事の所定箇所へ外部Markdownを引用形式で挿入します。
 
 ```bash
 kb arange-blog "a1b2-rag-local-llm-comparison"
 ```
 
-出力例:
-
-```
-✓ Updated: /path/to/vault/a1b2-rag-local-llm-comparison.md
-```
-
-注意: 挿入対象の構造（見出し名/パス）が想定と異なる場合は手動調整が必要になることがあります。
-
-### `kb search "<クエリ>"` — Vault 検索
-
-Vault 内のドキュメントをフルテキスト検索し、LLM 要約付きで結果を返す。
-
-```bash
-kb search "Next.js"
-kb search "型安全"
-```
-
----
-
-### `kb search-all "<クエリ>"` — 全キーワード検索
-
-スペース区切りのキーワードをすべて含むドキュメントを検索する（AND 検索）。
-
-```bash
-kb search-all "Next.js パフォーマンス 最適化"
-```
-
----
-
-### `kb question "<クエリ>" "<質問>"` — ドキュメント Q&A
-
-Vault 内の関連ドキュメントを検索し、LLM で質問に回答する。
-
-```bash
-kb question "Next.js パフォーマンス" "Next.js 16 のメリットを簡潔に教えて"
-```
-
----
-
 ## MCP Server 起動コマンド
 
 ```bash
 bun run src/interface/http/mcp-server.ts
+supabase start
 ```
 
-デフォルトポート: `3333`  
-エンドポイント: `http://localhost:3333/mcp`
+デフォルトポート: 3333
+エンドポイント: http://localhost:3333/mcp
 
-ポート変更:
+ポート変更例:
 
 ```bash
 MCP_PORT=4000 bun run src/interface/http/mcp-server.ts
 ```
 
----
-
 ## 環境変数
 
-| 変数                       | 説明                      | デフォルト |
-| -------------------------- | ------------------------- | ---------- |
-| `VAULT_PATH`               | Vault 出力先ディレクトリ  | — (必須)   |
-| `MODEL_PATH`               | Gemma3 .gguf ファイルパス | — (必須)   |
-| `MCP_PORT`                 | Bun MCP Server ポート     | `3333`     |
-| `RAG_DB_MAX_CONCURRENCY`   | DB 並列接続数             | `4`        |
-| `RAG_DB_QUERY_TIMEOUT_SEC` | DB クエリタイムアウト秒   | `60`       |
+| 変数                     | 説明                     | デフォルト                      |
+| ------------------------ | ------------------------ | ------------------------------- |
+| VAULT_PATH               | Vault 出力先ディレクトリ | 必須                            |
+| MODEL_PATH               | Gemma .gguf ファイルパス | 必須                            |
+| MCP_PORT                 | Bun MCP Server ポート    | 3333                            |
+| RAG_DB_MAX_CONCURRENCY   | DB 並列接続数            | 4                               |
+| RAG_DB_QUERY_TIMEOUT_SEC | DB クエリタイムアウト秒  | 60                              |
+| RAG_REPORT_OUTPUT_DIR    | ask-wiki-report 出力先   | backups/rag-volume-data/reports |

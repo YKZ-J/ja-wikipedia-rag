@@ -6,14 +6,14 @@ Wikipedia 135万記事をベクターDB に投入し、CLI から自然言語で
 
 ```
 kb ask-wiki "北海道の観光地と春のイベントを詳しく教えて"
-→ Wikipedia の関連記事を検索し、Gemma3 が 1,500 字の回答を生成して Vault に保存
+→ Wikipedia の関連記事を検索し、Gemma 2B (llama.cpp) が回答を生成して Vault に保存
 ```
 
 ---
 
 ## 特徴
 
-- **完全ローカル** — Gemma3 (llama-cpp) + nomic-embed-text (Ollama) でオフライン動作
+- **完全ローカル** — Gemma 2B (llama-cpp) + fastembed でオフライン動作
 - **高速ベクター検索** — pgvector IVFFlat (cosine) で ~95ms の近傍検索
 - **Wikipedia RAG** — 135万記事を Supabase (local) に投入済み
 - **CLI ファースト** — `kb ask-wiki` / `kb create-wiki` 等のシンプルなコマンド
@@ -23,14 +23,14 @@ kb ask-wiki "北海道の観光地と春のイベントを詳しく教えて"
 
 ## 技術スタック
 
-| コンポーネント   | 技術                                       |
-| ---------------- | ------------------------------------------ |
-| CLI / MCP Server | TypeScript + Bun                           |
-| LLM              | Gemma3 4b-it (llama-cpp-python, Metal GPU) |
-| Embedding        | nomic-embed-text (Ollama)                  |
-| Vector DB        | Supabase local (PostgreSQL + pgvector)     |
-| 検索インデックス | IVFFlat `lists=300, probes=20`             |
-| ドキュメント管理 | Markdown + Git (Obsidian 対応)             |
+| コンポーネント   | 技術                                   |
+| ---------------- | -------------------------------------- |
+| CLI / MCP Server | TypeScript + Bun                       |
+| LLM              | Gemma 2B (llama-cpp-python, Metal GPU) |
+| Embedding        | fastembed (ONNX Runtime)               |
+| Vector DB        | Supabase local (PostgreSQL + pgvector) |
+| 検索インデックス | IVFFlat `lists=300, probes=20`         |
+| ドキュメント管理 | Markdown + Git (Obsidian 対応)         |
 
 ---
 
@@ -38,7 +38,6 @@ kb ask-wiki "北海道の観光地と春のイベントを詳しく教えて"
 
 - macOS (Apple Silicon 推奨)
 - [Bun](https://bun.sh) v1.3+
-- [Ollama](https://ollama.ai) (`nomic-embed-text`, `gemma3:4b`)
 - [Supabase CLI](https://supabase.com/docs/guides/cli)
 - Python 3.12+ (venv)
 - [OrbStack](https://orbstack.dev) または Docker Desktop
@@ -75,18 +74,13 @@ bun link  # kb コマンドをグローバル登録
 source .venv/bin/activate
 ```
 
-### 5. Ollama モデルの取得
+### 5. モデルファイルの配置
 
-```bash
-ollama pull nomic-embed-text
-ollama pull gemma3:4b
-```
+Gemma 2B の GGUF ファイルを任意のディレクトリに配置し、`.env.local` の `MODEL_PATH` に設定してください。
 
-### 6. モデルファイルの配置
+### 6. fastembed の確認
 
-Gemma3 の GGUF ファイル (`gemma-3-4b-it-qat-q4_0.gguf`) を任意のディレクトリに配置し、`.env.local` の `MODEL_PATH` に設定してください。
-
-[Gemma3 GGUF ダウンロード元 (Hugging Face)](https://huggingface.co/google/gemma-3-4b-it-qat-GGUF)
+`requirements.txt` に `fastembed` が含まれているため、`./scripts/setup-python.sh` 後に追加作業は不要です。
 
 ### 7. Supabase の起動とマイグレーション適用
 
@@ -118,11 +112,14 @@ kb ask-wiki "富士山の標高と地質について教えて"
 kb create-wiki "TypeScript"
 kb create-wiki "北海道, 東京, 大阪"  # カンマ区切りで一括生成
 
-# LLM でドキュメントを生成
-kb create "Next.js 16 の新機能"
+# RAG 実測レポートを保存
+kb ask-wiki-report "北海道の観光名所を教えて"
 
-# Vault を検索
-kb search "Next.js"
+# RAG あり/なし比較記事を生成
+kb compare-wiki "東京都の観光名所を教えて"
+
+# 記事を再配置
+kb arange-blog "a1b2-rag-local-llm-comparison"
 ```
 
 詳細は [kb コマンド一覧](docs/kb-commands.md) を参照してください。
@@ -131,14 +128,15 @@ kb search "Next.js"
 
 ## ドキュメント
 
-| ドキュメント                                             | 内容                                   |
-| -------------------------------------------------------- | -------------------------------------- |
-| [docs/overview.md](docs/overview.md)                     | プロジェクト全体概要                   |
-| [docs/kb-commands.md](docs/kb-commands.md)               | kb コマンド一覧                        |
-| [docs/mcp-implementation.md](docs/mcp-implementation.md) | MCP 実装の全容                         |
-| [docs/database-setup.md](docs/database-setup.md)         | データベース初期設定                   |
-| [docs/wikipedia-pipeline.md](docs/wikipedia-pipeline.md) | Wikipedia データ投入・バックアップ手順 |
-| [docs/query-optimization.md](docs/query-optimization.md) | クエリ最適化フロー                     |
+| ドキュメント                                                                                           | 内容                                   |
+| ------------------------------------------------------------------------------------------------------ | -------------------------------------- |
+| [docs/overview.md](docs/overview.md)                                                                   | プロジェクト全体概要                   |
+| [docs/kb-commands.md](docs/kb-commands.md)                                                             | kb コマンド一覧                        |
+| [docs/mcp-implementation.md](docs/mcp-implementation.md)                                               | MCP 実装の全容                         |
+| [docs/database-setup.md](docs/database-setup.md)                                                       | データベース初期設定                   |
+| [docs/operational/documents-v2-recovery-runbook.md](docs/operational/documents-v2-recovery-runbook.md) | documents_v2 復旧手順（再作成方式）    |
+| [docs/wikipedia-pipeline.md](docs/wikipedia-pipeline.md)                                               | Wikipedia データ投入・バックアップ手順 |
+| [docs/query-optimization.md](docs/query-optimization.md)                                               | クエリ最適化フロー                     |
 
 ---
 

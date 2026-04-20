@@ -24,14 +24,6 @@ export type SearchDocResult = {
   path: string;
 };
 
-export type SearchResponse =
-  | { ok: true; matches: SearchDocResult[]; summary: string }
-  | ErrorResponse;
-
-export type QuestionResponse =
-  | { ok: true; matches: SearchDocResult[]; answer: string }
-  | ErrorResponse;
-
 export type WikiRagRanking = {
   rank: number;
   id: number;
@@ -48,6 +40,54 @@ export type WikiRagPreviewResponse =
       rankings: WikiRagRanking[];
     }
   | ErrorResponse;
+
+export type WikiRagReportDoc = {
+  rank: number;
+  id: number;
+  title: string;
+  content: string;
+  content_length: number;
+};
+
+export type WikiRagReport = {
+  query: string;
+  top_k: number;
+  generated_at: string;
+  extraction_mode: string;
+  search_queries: string[];
+  search_time_ms: number;
+  answer_time_ms: number;
+  total_time_ms: number;
+  answer_error: string;
+  answer: string;
+  runtime_parameters: {
+    model_path: string;
+    llm_preset: string;
+    max_context_chars: number;
+    content_preview_chars: number;
+    effective_top_k: number;
+    llm_params: {
+      max_tokens: number;
+      temperature: number;
+      top_k: number;
+      repeat_penalty: number;
+    };
+  };
+  context_chunk_sizes: Array<{
+    rank: number;
+    title: string;
+    chunk_chars: number;
+  }>;
+  top_docs: WikiRagReportDoc[];
+  ranked_sources: Array<{
+    rank: number;
+    id: number;
+    title: string;
+    content_length: number;
+  }>;
+};
+
+export type WikiRagReportResponse = ({ ok: true } & WikiRagReport) | ErrorResponse;
 
 // ---- 内部ユーティリティ ------------------------------------------
 
@@ -116,93 +156,12 @@ export async function callMCP(prompt: string): Promise<FileResponse> {
   }
 }
 
-export async function createDoc(title: string, tags: string[] = []): Promise<FileResponse> {
-  try {
-    const data = (await callTool("create_doc", { title, tags })) as {
-      file: string;
-    };
-    return { ok: true, file: data.file };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : "unknown",
-    };
-  }
-}
-
 export async function createWikiDoc(title: string, tags: string[] = []): Promise<FileResponse> {
   try {
     const data = (await callTool("create_doc_wiki", { title, tags })) as {
       file: string;
     };
     return { ok: true, file: data.file };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : "unknown",
-    };
-  }
-}
-
-export async function createNewsDoc(title: string, tags: string[] = []): Promise<FileResponse> {
-  try {
-    const data = (await callTool("create_news", { title, tags })) as {
-      file: string;
-    };
-    return { ok: true, file: data.file };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : "unknown",
-    };
-  }
-}
-
-export async function searchDocs(query: string): Promise<SearchResponse> {
-  try {
-    const data = (await callTool("search_docs", { query })) as {
-      matches: SearchDocResult[];
-      summary: string;
-    };
-    return {
-      ok: true,
-      matches: data.matches ?? [],
-      summary: data.summary ?? "",
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : "unknown",
-    };
-  }
-}
-
-export async function searchAllDocs(query: string): Promise<SearchResponse> {
-  try {
-    const data = (await callTool("search_all_docs", { query })) as {
-      matches: SearchDocResult[];
-      summary: string;
-    };
-    return {
-      ok: true,
-      matches: data.matches ?? [],
-      summary: data.summary ?? "",
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : "unknown",
-    };
-  }
-}
-
-export async function questionDocs(query: string, question: string): Promise<QuestionResponse> {
-  try {
-    const data = (await callTool("question_docs", { query, question })) as {
-      matches: SearchDocResult[];
-      answer: string;
-    };
-    return { ok: true, matches: data.matches ?? [], answer: data.answer ?? "" };
   } catch (error) {
     return {
       ok: false,
@@ -263,6 +222,23 @@ export async function askWikiRag(
       file: string;
     };
     return { ok: true, file: data.file };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "unknown",
+    };
+  }
+}
+
+export async function askWikiRagReport(query: string, topK = 3): Promise<WikiRagReportResponse> {
+  try {
+    const timeoutMs = Number(process.env.KB_RAG_REPORT_TIMEOUT_MS || "900000");
+    const data = (await callTool(
+      "ask_wiki_rag_report",
+      { query, topK },
+      timeoutMs,
+    )) as WikiRagReport;
+    return { ok: true, ...data };
   } catch (error) {
     return {
       ok: false,

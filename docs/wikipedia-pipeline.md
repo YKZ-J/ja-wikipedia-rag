@@ -13,7 +13,7 @@ Wikipedia XML ダンプ (.bz2)
 Parquet ファイル群 (parquet_output/*.parquet)
     │
     ▼  embed_and_upload.py
-Embedding 生成 (nomic-embed-text) + Supabase 投入
+Embedding 生成 (GTE) + Supabase 投入
     │
     ▼  マイグレーション適用
 IVFFlat インデックス + search_documents RPC
@@ -72,8 +72,8 @@ python3 python/xml_to_parquet.py \
 ### 事前準備
 
 ```bash
-# Ollama 起動（複数ポートで並列化する場合）
-./scripts/start-ollama-multi.sh   # ポート 11434〜11439 で 6 インスタンス起動
+# Python 環境セットアップ（未実施の場合）
+./scripts/setup-python.sh
 
 # 環境変数読み込み
 source .env.local
@@ -101,7 +101,7 @@ python3 -u python/embed_and_upload.py \
 ### 処理内容
 
 1. Parquet ファイルをチャンク読み込み
-2. `search_document: <テキスト[:100文字]>` プレフィックス付きで nomic-embed-text に投入
+2. GTE 埋め込みモデルでベクトルを生成
 3. 768次元ベクトル生成
 4. `asyncpg` で Supabase `documents` テーブルに upsert
 5. 完了したファイルに `.done` マーカーを付与
@@ -148,42 +148,33 @@ python3 python/seq_test.py --db --db-cases 3
 ### 6-1. pg_dump（DB フルバックアップ）
 
 ```bash
-# バックアップ作成
-./scripts/backup-and-restore.sh
-
-# または手動
+# 手動バックアップ
 pg_dump -Fc "$DATABASE_URL" -f /path/to/backup_$(date +%Y%m%d).dump
 ```
 
 ### 6-2. Parquet バックアップ
 
 ```bash
-./scripts/backup-parquet.sh
+tar czf /path/to/parquet_output_$(date +%Y%m%d).tar.gz parquet_output
 ```
 
 ### 6-3. 復元
 
 ```bash
-# DB からの復元
-./scripts/restore-only.sh /path/to/backup.dump
+# DB からの復元（ローカルコンテナ）
+cat /path/to/backup.dump | docker exec -i supabase_db_mcp-sever sh -lc \
+    "pg_restore --verbose --clean --if-exists --no-owner --no-acl -U postgres -d postgres"
 
 # Parquet だけ復元
-./scripts/restore-parquet.sh
+tar xzf /path/to/parquet_output_YYYYMMDD.tar.gz
 ```
 
 ---
 
-## 7. nomic-embed-text のプレフィックス仕様
+## 7. 埋め込みモデル運用メモ
 
-| 用途         | プレフィックス                |
-| ------------ | ----------------------------- |
-| 文書保存時   | `search_document: <テキスト>` |
-| 検索クエリ時 | `search_query: <クエリ>`      |
-
-非対称検索モデル（Asymmetric Retrieval）の仕様。プレフィックスを付け忘れると検索精度が大幅に低下する。
-
-- Parquet → Supabase 投入時: `DOCUMENT_PREFIX = "search_document: "`
-- `rag_ask` でクエリ埋め込み時: `"search_query: " + text`
+現行の `python/embed_and_upload.py` は GTE ベースの埋め込みを利用します。
+Ollama の起動や `search_document:` / `search_query:` のプレフィックス運用は不要です。
 
 ---
 

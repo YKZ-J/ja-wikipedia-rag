@@ -2,7 +2,7 @@
 """
 Knowledge Base LLM MCP Server (FastMCP / stdio)
 
-llama-cpp (Gemma3) をラップした MCP サーバー。
+llama-cpp (Gemma) をラップした MCP サーバー。
 TypeScript 側から StdioClientTransport 経由で呼び出される。
 
 Tools:
@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import sys
+import time
 import unicodedata
 from collections import OrderedDict
 from datetime import datetime
@@ -26,13 +27,18 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+from gte_embedding import DEFAULT_EMBEDDING_MODEL, GteEmbeddingModel
 from llama_cpp import Llama
 from mcp.server.fastmcp import FastMCP
 
 # ============================================================
 # 設定
 # ============================================================
-MODEL_PATH = os.environ.get("MODEL_PATH", "")
+# .env.local を先に読み込み、既存環境変数より優先して解決する。
+load_dotenv(".env.local", override=True)
+
+_DEFAULT_MODEL_PATH = "/Users/ykz/programming/models/gemma-4-E2B-it-Q4_0.gguf"
+MODEL_PATH = os.environ.get("MODEL_PATH", "").strip() or _DEFAULT_MODEL_PATH
 DEFAULT_VAULT_PATH = os.environ.get("VAULT_PATH", "")
 
 mcp = FastMCP("kb-llm-server")
@@ -154,6 +160,9 @@ _QUERY_NORMALIZATION_TIMEOUT_SEC = float(
 _QUERY_NORMALIZATION_NUM_PREDICT = int(
     os.environ.get("RAG_QUERY_NORMALIZATION_NUM_PREDICT", "192")
 )
+_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+_EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", "64"))
+_EMBEDDING_MAX_LENGTH = int(os.environ.get("EMBEDDING_MAX_LENGTH", "512"))
 _embed_cache: "OrderedDict[str, list[float]]" = OrderedDict()
 
 _LLAMA_PRESETS: dict[str, dict[str, float | int]] = {
@@ -185,6 +194,13 @@ _LLAMA_PRESETS: dict[str, dict[str, float | int]] = {
         "top_k": 40,
         "repeat_penalty": 1.08,
     },
+    # RAG回答向け（コンテキスト前提）
+    "qa_rag": {
+        "max_tokens": 3000,
+        "temperature": 0.5,
+        "top_k": 20,
+        "repeat_penalty": 1.08,
+    },
     # compare-wiki 専用の軽量非RAG回答（フリーズ抑制）
     "compare_non_rag_light": {
         "max_tokens": 1200,
@@ -202,13 +218,13 @@ _LLAMA_PRESETS: dict[str, dict[str, float | int]] = {
 }
 
 _SUMMARIZE_MODE_DEFAULT = "non_rag_minimal"
-_SUMMARIZE_MODE_MAP: dict[str, tuple[str, bool, bool]] = {
-    # mode: (preset, wrap_non_rag_prompt, use_ollama)
-    "non_rag_minimal": ("non_rag_minimal", True, False),
-    "search_summary": ("search_summary", False, False),
-    "qa_non_rag": ("qa_non_rag", False, False),
-    "compare_non_rag_light": ("compare_non_rag_light", False, True),
-    "news_article": ("news_article", False, False),
+_SUMMARIZE_MODE_MAP: dict[str, tuple[str, bool]] = {
+    # mode: (preset, wrap_non_rag_prompt)
+    "non_rag_minimal": ("non_rag_minimal", True),
+    "search_summary": ("search_summary", False),
+    "qa_non_rag": ("qa_non_rag", False),
+    "compare_non_rag_light": ("compare_non_rag_light", False),
+    "news_article": ("news_article", False),
 }
 
 
@@ -254,37 +270,11 @@ def _run_llama_with_preset(prompt: str, preset: str) -> str:
     return str(result["choices"][0]["text"]).strip()
 
 
-def _run_ollama_summarize(prompt: str, preset: str) -> str:
-    """Ollama API 経由で要約する。llama-cpp モデルを使わないためメモリ増加を回避する。"""
-    import json as _json
-    import urllib.request
-
-    params = _LLAMA_PRESETS[preset]
-    max_tokens = int(params["max_tokens"])
-    data = _json.dumps({
-        "model": "gemma3:4b",
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "options": {
-            "num_ctx": max_tokens + 2048,
-            "num_predict": max_tokens,
-            "temperature": float(params["temperature"]),
-            "top_k": int(params["top_k"]),
-        },
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        "http://localhost:11434/api/chat",
-        data=data,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        result = _json.loads(resp.read())
-    return result.get("message", {}).get("content", "").strip()
-
 # ============================================================
 # LLM シングルトン（遅延初期化）
 # ============================================================
 _llm: Llama | None = None
+_embedder: GteEmbeddingModel | None = None
 
 
 def get_llm() -> Llama:
@@ -311,6 +301,17 @@ def get_llm() -> Llama:
             n_batch=512,
         )
     return _llm
+
+
+def get_embedder() -> GteEmbeddingModel:
+    global _embedder
+    if _embedder is None:
+        _embedder = GteEmbeddingModel(
+            model_name=_EMBEDDING_MODEL,
+            batch_size=_EMBEDDING_BATCH_SIZE,
+            max_length=_EMBEDDING_MAX_LENGTH,
+        )
+    return _embedder
 
 
 # ============================================================
@@ -351,6 +352,39 @@ def trim_summary(text: str, max_len: int = 300) -> str:
         truncated.rfind("?"),
     )
     return truncated[: cut + 1] if cut > 20 else truncated.rstrip()
+
+
+def _sanitize_rag_answer_text(text: str) -> str:
+    """RAG回答テキストのノイズ（EOS以降・重複段落）を除去する。"""
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+
+    eos_markers = ("<eos>", "</s>", "<|eot_id|>", "[END]")
+    lower_cleaned = cleaned.lower()
+    cut_index = len(cleaned)
+    for marker in eos_markers:
+        pos = lower_cleaned.find(marker.lower())
+        if pos >= 0:
+            cut_index = min(cut_index, pos)
+    cleaned = cleaned[:cut_index].strip()
+
+    if not cleaned:
+        return ""
+
+    blocks = [b.strip() for b in re.split(r"\n{2,}", cleaned) if b.strip()]
+    deduped_blocks: list[str] = []
+    seen: set[str] = set()
+    for block in blocks:
+        normalized = " ".join(block.split())
+        if normalized in {"---", "*", "**"}:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped_blocks.append(block)
+
+    return "\n\n".join(deduped_blocks).strip()
 
 
 def build_summary_from_body(body: str) -> str:
@@ -523,7 +557,7 @@ def generate_doc(
     summary = trim_summary(normalize_summary(summary_raw)) or "自動生成された概要"
 
     body_text = detail_text or body_text
-    now = datetime.now()
+    now = datetime.now(ZoneInfo("Asia/Tokyo"))
     today = now.strftime("%Y-%m-%d")
     doc_id = now.strftime("%Y%m%d%H%M%S")
     tags_field = ", ".join(all_tags)
@@ -559,12 +593,10 @@ def summarize(prompt: str, mode: str = _SUMMARIZE_MODE_DEFAULT) -> str:
         prompt: LLM に渡すプロンプト文字列
         mode:   プロンプト/パラメータのプリセット
     """
-    preset, wrap_prompt, use_ollama = _SUMMARIZE_MODE_MAP.get(
+    preset, wrap_prompt = _SUMMARIZE_MODE_MAP.get(
         mode, _SUMMARIZE_MODE_MAP[_SUMMARIZE_MODE_DEFAULT]
     )
     llm_prompt = _build_non_rag_prompt(prompt) if wrap_prompt else prompt
-    if use_ollama:
-        return _run_ollama_summarize(llm_prompt, preset)
     return _run_llama_with_preset(llm_prompt, preset)
 
 
@@ -580,6 +612,21 @@ def get_db_url() -> str:
             ".env.local を作成して DATABASE_URL を設定してください。"
         )
     return url
+
+
+async def _is_documents_v2_empty(db_url: str) -> bool:
+    """documents_v2 が空かどうかを返す。確認失敗時は False 扱い。"""
+    import asyncpg
+
+    try:
+        conn = await asyncpg.connect(db_url, command_timeout=5)
+        try:
+            count = await conn.fetchval("SELECT COUNT(*) FROM documents_v2")
+            return int(count or 0) == 0
+        finally:
+            await conn.close()
+    except Exception:
+        return False
 
 
 def _extract_search_queries_rule_based(query: str) -> tuple[str, list[str], list[str]]:
@@ -604,7 +651,7 @@ def _extract_search_queries_rule_based(query: str) -> tuple[str, list[str], list
         search_base,
     )
 
-    # 先頭クエリはユーザー質問を無加工でそのまま使う（Gemma3 への質問と同一）。
+    # 先頭クエリはユーザー質問を無加工でそのまま使う（Gemma への質問と同一）。
     # 補助クエリのみ search_base から生成する。
     vector_queries: list[str] = [query]
     title_queries: list[str] = []
@@ -1028,9 +1075,7 @@ def _score_title_match(title: str, noun: str) -> float:
 
 
 async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str], list[str]]:
-    """Gemma3 で質問整形を行い、検索クエリ候補を返す。"""
-    import aiohttp
-
+    """Gemma で質問整形を行い、検索クエリ候補を返す。"""
     prompt = (
         "あなたはWikipedia検索用のクエリ整形アシスタントです。\n"
         "ユーザー質問(下記の今回のWikipedia検索用のクエリ整形対象の質問:の部分)を、意味を変えずに検索しやすい形へ整形してください。\n"
@@ -1047,31 +1092,28 @@ async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]
     )
 
     async def call_normalizer(num_predict: int) -> tuple[str, str]:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": "gemma3:4b",
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        # 質問整形は決定的な短文出力のみ必要なため、低温度を維持
-                        "temperature": 0.0,
-                        "num_predict": num_predict,
-                        "num_ctx": 1024,
-                    },
-                },
-                timeout=aiohttp.ClientTimeout(total=_QUERY_NORMALIZATION_TIMEOUT_SEC),
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-        raw_text = str(data.get("response", "")).strip()
-        done_reason = str(data.get("done_reason", ""))
-        return raw_text, done_reason
+        def _run() -> tuple[str, str]:
+            llm = get_llm()
+            result = llm(
+                prompt=prompt,
+                max_tokens=num_predict,
+                temperature=0.0,
+                top_k=20,
+                repeat_penalty=1.0,
+            )
+            choice = result["choices"][0]
+            raw_text = str(choice.get("text", "")).strip()
+            done_reason = str(choice.get("finish_reason", ""))
+            return raw_text, done_reason
+
+        return await asyncio.wait_for(
+            asyncio.to_thread(_run),
+            timeout=_QUERY_NORMALIZATION_TIMEOUT_SEC,
+        )
 
     raw, done_reason = await call_normalizer(_QUERY_NORMALIZATION_NUM_PREDICT)
     parsed = _parse_json_object_from_text(raw)
-    if not parsed and done_reason == "length":
+    if not parsed and done_reason in {"length", "max_tokens"}:
         # 生成打ち切り時のみ1回だけ拡張リトライする
         retry_num_predict = max(_QUERY_NORMALIZATION_NUM_PREDICT * 2, 256)
         print(
@@ -1085,7 +1127,7 @@ async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]
     if not parsed:
         preview = raw[:220].replace("\n", "\\n")
         raise ValueError(
-            "Gemma3 query normalization returned non-JSON output "
+            "Gemma query normalization returned non-JSON output "
             f"(done_reason={done_reason}, preview={preview!r})"
         )
 
@@ -1160,7 +1202,7 @@ async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]
 
 
 async def _extract_search_queries(query: str) -> tuple[str, list[str], list[str], str]:
-    """検索クエリ抽出。Gemma3を優先し、失敗時はルールベースへフォールバックする。"""
+    """検索クエリ抽出。Gemmaを優先し、失敗時はルールベースへフォールバックする。"""
     try:
         extracted = await _extract_search_queries_with_gemma(query)
         print("[_extract_search_queries] mode=gemma_json", file=sys.stderr)
@@ -1221,15 +1263,108 @@ def _merge_ranked_docs(
     return [doc_by_id[doc_id] for doc_id in ranked_ids]
 
 
+def _collect_relevance_terms(query: str, sub_queries: list[str]) -> list[str]:
+    """質問との語彙一致で再ランキングするための語を抽出する。"""
+    terms: list[str] = []
+    seen: set[str] = set()
+    sources = [query, *sub_queries]
+
+    for source in sources:
+        normalized = _normalize_query_term(source)
+        if not normalized:
+            continue
+
+        # 日本語の連結語（例: 北海道の観光名所）を短い検索語へ分解する。
+        for token in _RE_JP_KEYWORD.findall(normalized):
+            if token in _GENERIC_SECONDARY_QUERIES:
+                continue
+            if len(token) < 2 and token not in _SINGLE_KANJI_SET:
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            terms.append(token)
+            if len(terms) >= 18:
+                return terms
+
+        for token in _RE_GROUNDED_TOKEN.findall(normalized):
+            if token in _GENERIC_SECONDARY_QUERIES:
+                continue
+            if len(token) < 2 and token not in _SINGLE_KANJI_SET:
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            terms.append(token)
+            if len(terms) >= 18:
+                return terms
+    return terms
+
+
+def _rerank_docs_by_query_relevance(docs: list[dict], query: str, sub_queries: list[str]) -> list[dict]:
+    """ベクトル順位に語彙一致シグナルを加味して文脈候補を再整列する。"""
+    if not docs:
+        return docs
+
+    terms = _collect_relevance_terms(query, sub_queries)
+    if not terms:
+        return docs
+
+    def lexical_score(doc: dict) -> float:
+        title = str(doc.get("title", ""))
+        content_head = str(doc.get("content", ""))[:2400]
+        score = 0.0
+        for term in terms:
+            if term in title:
+                score += 26.0 + min(len(term), 10)
+            elif term in content_head:
+                score += 6.0
+        return score
+
+    scored: list[tuple[float, int, dict]] = []
+    for rank, doc in enumerate(docs):
+        score = max(0.0, 24.0 - rank * 1.2) + lexical_score(doc)
+
+        scored.append((score, -rank, doc))
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item[2] for item in scored]
+
+
+def _is_low_relevance_top_doc(doc: dict | None, relevance_terms: list[str], term_limit: int = 12) -> bool:
+    """上位ドキュメントが質問に対して低関連かを判定する。"""
+    if doc is None:
+        return True
+
+    title = str(doc.get("title", ""))
+    content_head = str(doc.get("content", ""))[:2400]
+    title_hits = sum(1 for term in relevance_terms[:term_limit] if term in title)
+    content_hits = sum(1 for term in relevance_terms[:term_limit] if term in content_head)
+
+    # タイトルに1語でも一致すれば関連ありとみなす。
+    if title_hits >= 1:
+        return False
+    # タイトル一致がなくても本文に十分な一致があれば関連あり。
+    if content_hits >= 3:
+        return False
+
+    return True
+
+
 async def _retrieve_rag_docs(
     query: str,
     db_url: str,
+    force_rule_based: bool = False,
+    vector_query_limit: int | None = None,
 ) -> tuple[list[dict], list[str], list[list[dict]], str, list[dict]]:
     """RAG 用の検索を実行し、統合済み候補を返す。"""
-    import aiohttp
     import asyncpg
 
-    _, all_vector_queries, all_title_queries, extraction_mode = await _extract_search_queries(query)
+    if force_rule_based:
+        _, all_vector_queries, all_title_queries = _extract_search_queries_rule_based(query)
+        extraction_mode = "rule_based_fast"
+    else:
+        _, all_vector_queries, all_title_queries, extraction_mode = await _extract_search_queries(query)
     latin_terms = list(dict.fromkeys([token.lower() for token in _RE_LATIN_TOKEN.findall(query)]))
     subject_terms = set(re.findall(r"の([^の\s、。]{1,20})について", query))
 
@@ -1298,6 +1433,10 @@ async def _retrieve_rag_docs(
                 vector_queries.append(term)
             if len(vector_queries) >= 4:
                 break
+
+    if vector_query_limit is not None:
+        limited = max(1, int(vector_query_limit))
+        vector_queries = vector_queries[:limited]
 
     title_candidates = list(dict.fromkeys(all_title_queries))
 
@@ -1386,27 +1525,35 @@ async def _retrieve_rag_docs(
         if tq and tq not in anchor_terms:
             anchor_terms.append(tq)
 
-    async def embed_one(session: "aiohttp.ClientSession", text: str) -> list[float]:
+    async def embed_one(text: str) -> list[float]:
         cached = _lru_get(_embed_cache, text)
         if cached is not None:
             return cached
-        async with session.post(
-            "http://localhost:11434/api/embed",
-            json={"model": "nomic-embed-text", "input": "search_query: " + text},
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-        embedding = data["embeddings"][0]
+
+        def _run_gte() -> list[float]:
+            return get_embedder().embed_sync([text])[0]
+
+        embedding = await asyncio.to_thread(_run_gte)
         _lru_set(_embed_cache, text, embedding, _EMBED_CACHE_MAX)
         return embedding
 
     async def search_one(pool: "asyncpg.Pool", emb: list[float]) -> list[dict]:
         emb_str = "[" + ",".join(map(str, emb)) + "]"
+        match_count = int(os.environ.get("RAG_VECTOR_MATCH_COUNT", "8"))
+        oversampling = int(os.environ.get("RAG_VECTOR_OVERSAMPLING", "24"))
+        if match_count < 1:
+            match_count = 1
+        if oversampling < match_count:
+            oversampling = match_count
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, title, content FROM search_documents($1::vector)",
+                """
+                SELECT article_id AS id, title, content
+                FROM search_documents_v2_dedup($1::vector, $2::int, $3::int)
+                """,
                 emb_str,
+                match_count,
+                oversampling,
             )
         return [{"id": r["id"], "title": r["title"], "content": r["content"]} for r in rows]
 
@@ -1417,12 +1564,47 @@ async def _retrieve_rag_docs(
 
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                """SELECT id, title, content FROM documents
-                   WHERE title = $1 OR title = $2 OR title ILIKE $3
-                   LIMIT 80""",
+                """
+                                WITH candidates AS (
+                                    SELECT article_id, title, content, chunk_index
+                                    FROM (
+                                        SELECT article_id, title, content, chunk_index
+                                        FROM documents_v2
+                                        WHERE title = $1
+                                        LIMIT 16
+                                    ) t1
+
+                                    UNION ALL
+
+                                    SELECT article_id, title, content, chunk_index
+                                    FROM (
+                                        SELECT article_id, title, content, chunk_index
+                                        FROM documents_v2
+                                        WHERE title = $2
+                                        LIMIT 16
+                                    ) t2
+
+                                    UNION ALL
+
+                                    SELECT article_id, title, content, chunk_index
+                                    FROM (
+                                        SELECT article_id, title, content, chunk_index
+                                        FROM documents_v2
+                                        WHERE title LIKE $3
+                                        LIMIT 32
+                                    ) t3
+                                )
+                                SELECT DISTINCT ON (article_id)
+                                    article_id AS id,
+                                    title,
+                                    content
+                                FROM candidates
+                                ORDER BY article_id, chunk_index ASC
+                                LIMIT 48
+                """,
                 f"{normalized_noun}一覧",
                 normalized_noun,
-                f"%{normalized_noun}%",
+                f"{normalized_noun}%",
             )
         docs = [{"id": r["id"], "title": r["title"], "content": r["content"]} for r in rows]
         scored_docs: list[tuple[float, int, dict]] = []
@@ -1441,16 +1623,14 @@ async def _retrieve_rag_docs(
         except Exception as exc:  # noqa: BLE001
             return task_type, None, exc
 
-    async with aiohttp.ClientSession() as session:
-        import asyncio as _asyncio
-
-        embs = await _asyncio.gather(*[embed_one(session, q) for q in vector_queries])
+    import asyncio as _asyncio
+    embs = await _asyncio.gather(*[embed_one(q) for q in vector_queries])
 
     import sys as _sys
     import asyncio as _asyncio
 
     max_concurrency = int(os.environ.get("RAG_DB_MAX_CONCURRENCY", "4"))
-    query_timeout_s = float(os.environ.get("RAG_DB_QUERY_TIMEOUT_SEC", "60"))
+    query_timeout_s = float(os.environ.get("RAG_DB_QUERY_TIMEOUT_SEC", "25"))
     sem = _asyncio.Semaphore(max_concurrency)
 
     async def limited(coro: "asyncio.Future[list[dict]]") -> list[dict]:
@@ -1534,9 +1714,21 @@ async def _retrieve_rag_docs(
             if filtered_docs:
                 docs = filtered_docs
 
+    rerank_queries = list(dict.fromkeys([*all_vector_queries, *title_queries]))
+    docs = _rerank_docs_by_query_relevance(docs, query, rerank_queries)
+
+    relevance_terms = _collect_relevance_terms(query, rerank_queries)
+    if relevance_terms:
+        top_doc = docs[0] if docs else None
+        low_relevance = _is_low_relevance_top_doc(top_doc, relevance_terms)
+
+        # 追加の重いDB検索は行わず、既存候補だけで再ランキングする。
+        if low_relevance and docs:
+            docs = _rerank_docs_by_query_relevance(docs, query, rerank_queries)
+
     ranked_top20_docs = docs[:20]
 
-    # Gemma3 入力は最大 3 件（ランキング上位を優先）
+    # Gemma 入力は最大 3 件（ランキング上位を優先）
     return docs[:3], vector_queries, title_lists, extraction_mode, ranked_top20_docs
 
 
@@ -1560,7 +1752,14 @@ def _parse_selected_doc_ids(raw: str) -> list[int]:
 async def rag_rankings(query: str) -> str:
     """質問に対するRAG検索ランキング上位20件をJSONで返す。"""
     db_url: str = get_db_url()
-    _, sub_queries, _, extraction_mode, ranked_top20_docs = await _retrieve_rag_docs(query, db_url)
+    use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "1") != "0"
+    report_vector_query_limit = int(os.environ.get("RAG_REPORT_VECTOR_QUERY_LIMIT", "1"))
+    _, sub_queries, _, extraction_mode, ranked_top20_docs = await _retrieve_rag_docs(
+        query,
+        db_url,
+        force_rule_based=use_rule_based,
+        vector_query_limit=report_vector_query_limit,
+    )
     payload = {
         "query": query,
         "extraction_mode": extraction_mode,
@@ -1578,8 +1777,169 @@ async def rag_rankings(query: str) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+@mcp.tool()
+async def rag_answer_report(query: str, top_k: int = 3) -> str:
+    """質問に対するRAG回答と計測情報をJSONで返す（top_kは最大3）。"""
+    db_url: str = get_db_url()
+    effective_top_k = 3 if top_k <= 0 else min(int(top_k), 3)
+    use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "1") != "0"
+    report_vector_query_limit = int(os.environ.get("RAG_REPORT_VECTOR_QUERY_LIMIT", "1"))
+
+    search_started = time.perf_counter()
+    docs, sub_queries, _, extraction_mode, ranked_top20_docs = await _retrieve_rag_docs(
+        query,
+        db_url,
+        force_rule_based=use_rule_based,
+        vector_query_limit=report_vector_query_limit,
+    )
+    relevance_terms = _collect_relevance_terms(query, sub_queries)
+
+    docs = _rerank_docs_by_query_relevance(docs, query, sub_queries)
+    ranked_top20_docs = _rerank_docs_by_query_relevance(ranked_top20_docs, query, sub_queries)
+
+    # 質問との語彙一致が弱い場合でも、重い追加DB検索は行わず既存候補で再整列する。
+    low_relevance = False
+    if relevance_terms:
+        top_doc = docs[0] if docs else None
+        low_relevance = _is_low_relevance_top_doc(top_doc, relevance_terms, term_limit=10)
+
+        if low_relevance and docs:
+            docs = _rerank_docs_by_query_relevance(docs, query, sub_queries)
+            ranked_top20_docs = docs[:20]
+
+    search_time_ms = int((time.perf_counter() - search_started) * 1000)
+
+    docs = docs[:effective_top_k]
+    content_preview_chars = int(os.environ.get("RAG_REPORT_CONTENT_PREVIEW_CHARS", "2000"))
+    top_docs_payload = [
+        {
+            "rank": idx,
+            "id": int(doc["id"]),
+            "title": str(doc["title"]),
+            "content": str(doc.get("content", ""))[:content_preview_chars],
+            "content_length": len(str(doc.get("content", ""))),
+        }
+        for idx, doc in enumerate(docs, start=1)
+    ]
+
+    answer_started = time.perf_counter()
+    answer_error = ""
+    context_chunk_sizes: list[dict[str, int | str]] = []
+    max_context_chars = int(os.environ.get("RAG_REPORT_MAX_CONTEXT_CHARS", "10000"))
+    llm_preset_name = "qa_rag"
+    llm_preset = _LLAMA_PRESETS.get(llm_preset_name, {})
+    db_empty = False
+    if not docs:
+        db_empty = await _is_documents_v2_empty(db_url)
+
+    if not docs:
+        if db_empty:
+            answer = (
+                "関連する情報が見つかりませんでした。"
+                "原因候補: documents_v2 テーブルが空です。"
+                "データ投入または復元を実施してください。"
+            )
+            answer_error = "documents_v2 is empty"
+        else:
+            answer = "関連する情報が見つかりませんでした。"
+    elif low_relevance:
+        answer = (
+            "検索結果に質問と直接対応する根拠が不足しているため、回答生成をスキップしました。"
+            "検索語やデータ品質を見直してください。"
+        )
+    else:
+        used = 0
+        context_sources: list[tuple[str, str]] = []
+        for doc in docs:
+            title = str(doc["title"])
+            body = str(doc.get("content", ""))
+            if not body:
+                continue
+            remain = max_context_chars - used
+            if remain <= 0:
+                break
+            piece = body[:remain]
+            if not piece:
+                continue
+            context_sources.append((title, piece))
+            used += len(piece)
+
+        if not context_sources:
+            answer = "関連する情報が見つかりませんでした。"
+        else:
+            context = "\n\n".join([f"【{title}】\n{body}" for title, body in context_sources])
+            context_chunk_sizes = [
+                {
+                    "rank": idx,
+                    "title": title,
+                    "chunk_chars": len(body),
+                }
+                for idx, (title, body) in enumerate(context_sources, start=1)
+            ]
+            rag_messages = _build_rag_messages(context, query)
+            prefill = rag_messages[2]["content"]
+            llm_prompt = (
+                f"{rag_messages[0]['content']}\n\n"
+                f"{rag_messages[1]['content']}\n\n"
+                f"{prefill}"
+            )
+            try:
+                llm_text = await asyncio.to_thread(_run_llama_with_preset, llm_prompt, llm_preset_name)
+                answer = _sanitize_rag_answer_text(prefill + llm_text.strip())
+                if not answer:
+                    answer = "回答を生成できませんでした。"
+            except Exception as exc:  # noqa: BLE001
+                answer_error = str(exc)
+                answer = (
+                    "回答生成に失敗しました。"
+                    "モデルパスや実行パラメータを確認してください。"
+                )
+
+    answer_time_ms = int((time.perf_counter() - answer_started) * 1000)
+    total_time_ms = search_time_ms + answer_time_ms
+    now_jst = datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(timespec="seconds")
+
+    payload = {
+        "query": query,
+        "top_k": effective_top_k,
+        "generated_at": now_jst,
+        "extraction_mode": extraction_mode,
+        "search_queries": sub_queries,
+        "search_time_ms": search_time_ms,
+        "answer_time_ms": answer_time_ms,
+        "total_time_ms": total_time_ms,
+        "answer_error": answer_error,
+        "answer": answer,
+        "runtime_parameters": {
+            "model_path": MODEL_PATH,
+            "llm_preset": llm_preset_name,
+            "max_context_chars": max_context_chars,
+            "content_preview_chars": content_preview_chars,
+            "effective_top_k": effective_top_k,
+            "llm_params": {
+                "max_tokens": int(llm_preset.get("max_tokens", 0)),
+                "temperature": float(llm_preset.get("temperature", 0.0)),
+                "top_k": int(llm_preset.get("top_k", 0)),
+                "repeat_penalty": float(llm_preset.get("repeat_penalty", 0.0)),
+            },
+        },
+        "context_chunk_sizes": context_chunk_sizes,
+        "top_docs": top_docs_payload,
+        "ranked_sources": [
+            {
+                "rank": idx,
+                "id": int(doc["id"]),
+                "title": str(doc["title"]),
+                "content_length": len(str(doc.get("content", ""))),
+            }
+            for idx, doc in enumerate(ranked_top20_docs, start=1)
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _build_rag_messages(context: str, user_prompt: str) -> list[dict[str, str]]:
-    """Gemma3 chat API 用の system/user/assistant(先行注入) メッセージを構築する。"""
+    """Gemma chat API 用の system/user/assistant(先行注入) メッセージを構築する。"""
     system_msg = (
         "あなたは日本語の解説ライターです。"
         "ユーザーの質問に対して、提供された参照資料の情報を十分に活用し、"
@@ -1595,7 +1955,7 @@ def _build_rag_messages(context: str, user_prompt: str) -> list[dict[str, str]]:
         "- 参照資料に含まれない事実を創作しないこと。"
     )
     # コンテキストを先に配置し、質問を末尾に置く。
-    # 質問が生成開始位置に近いほど Gemma3:4b の注意が質問に向きやすい。
+    # 質問が生成開始位置に近いほど Gemma の注意が質問に向きやすい。
     user_msg = (
         f"以下は参照資料です。\n\n"
         f"{context}\n\n"
@@ -1644,17 +2004,30 @@ async def rag_ask(
     mode: str = "default",
 ) -> str:
     """
-    ローカル Wikipedia vectorDB を検索し Gemma3(Ollama) で回答を生成して Vault に保存する。
+    ローカル Wikipedia vectorDB を検索し llama.cpp で回答を生成して Vault に保存する。
 
     Args:
         query:     質問文字列
         vault_dir: 出力先ディレクトリ（省略時は VAULT_PATH 環境変数）
         tags:      カンマ区切りのタグ文字列
     """
-    import aiohttp
-
     db_url: str = get_db_url()
-    docs, sub_queries, title_lists, extraction_mode, ranked_top20_docs = await _retrieve_rag_docs(query, db_url)
+    is_compare_mode = (mode or "").lower() == "compare"
+    if is_compare_mode:
+        docs, sub_queries, title_lists, extraction_mode, ranked_top20_docs = await _retrieve_rag_docs(
+            query,
+            db_url,
+        )
+    else:
+        # ask-wiki は ask-wiki-report と同じ検索条件を使う。
+        use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "1") != "0"
+        report_vector_query_limit = int(os.environ.get("RAG_REPORT_VECTOR_QUERY_LIMIT", "1"))
+        docs, sub_queries, title_lists, extraction_mode, ranked_top20_docs = await _retrieve_rag_docs(
+            query,
+            db_url,
+            force_rule_based=use_rule_based,
+            vector_query_limit=report_vector_query_limit,
+        )
     selected_ids = _parse_selected_doc_ids(selected_doc_ids)
 
     if selected_ids and ranked_top20_docs:
@@ -1680,7 +2053,7 @@ async def rag_ask(
     ]
     ranking_text = "\n".join(ranking_lines) if ranking_lines else "（取得なし）"
 
-    # --- Ollama Gemma3 で回答生成（非同期） ---
+    # --- llama.cpp で回答生成 ---
     context_stats_md = ""
 
     if not docs:
@@ -1697,11 +2070,19 @@ async def rag_ask(
             "  - （なし）"
         )
     else:
-        is_compare_mode = (mode or "").lower() == "compare"
         compare_max_docs = max(1, int(os.environ.get("KB_COMPARE_RAG_MAX_DOCS", "4")))
-        # 通常は上位2件。compareでは選択順を尊重しつつ上限を低めにしてメモリピークを抑える。
-        TARGET_DOCS_FOR_GEMMA = min(compare_max_docs, len(docs)) if selected_ids else 2
-        docs = docs[:TARGET_DOCS_FOR_GEMMA]
+        # 通常ask-wikiはreportと同じ上位3件を使用。compareでは選択順を尊重しつつ上限を低めにする。
+        if is_compare_mode:
+            target_docs_for_gemma = min(compare_max_docs, len(docs)) if selected_ids else 2
+            llm_preset_name = "qa_non_rag"
+            max_context_chars = int(os.environ.get("KB_COMPARE_RAG_MAX_CONTEXT_CHARS", "9000"))
+        else:
+            target_docs_for_gemma = min(3, len(docs))
+            llm_preset_name = "qa_rag"
+            max_context_chars = int(os.environ.get("RAG_REPORT_MAX_CONTEXT_CHARS", "10000"))
+
+        llm_preset = _LLAMA_PRESETS.get(llm_preset_name, {})
+        docs = docs[:target_docs_for_gemma]
         retrieved_docs_count = len(docs)
 
         title_matched_ids = set()
@@ -1719,12 +2100,7 @@ async def rag_ask(
 
         # 入力コンテキストを安全側で制限する。
         # さらにAPI側で context overflow が発生した場合は、本文を段階的に縮小して再試行する。
-        MAX_CONTEXT_CHARS = int(
-            os.environ.get(
-                "KB_COMPARE_RAG_MAX_CONTEXT_CHARS" if is_compare_mode else "RAG_MAX_CONTEXT_CHARS",
-                "9000" if is_compare_mode else "14000",
-            )
-        )
+        MAX_CONTEXT_CHARS = max_context_chars
         MIN_CONTEXT_CHARS = int(os.environ.get("RAG_MIN_CONTEXT_CHARS", "1200"))
 
         base_sources: list[tuple[str, str]] = []
@@ -1757,108 +2133,89 @@ async def rag_ask(
         context_sources = build_context_sources(current_limit)
         source_char_stats: list[tuple[str, int]] = []
         total_ctx_chars = 0
-        gen_data: dict | None = None
+        llm_text: str | None = None
         prefill = ""
 
-        async with aiohttp.ClientSession() as session:
-            for attempt in range(3):
-                context_parts = [f"【{title}】\n{body}" for title, body in context_sources]
-                source_char_stats = [(title, len(body)) for title, body in context_sources]
-                total_ctx_chars = sum(size for _, size in source_char_stats)
+        for attempt in range(3):
+            context_parts = [f"【{title}】\n{body}" for title, body in context_sources]
+            source_char_stats = [(title, len(body)) for title, body in context_sources]
+            total_ctx_chars = sum(size for _, size in source_char_stats)
 
-                context = "\n\n".join(context_parts)
-                rag_messages = _build_rag_messages(context, query)
+            context = "\n\n".join(context_parts)
+            rag_messages = _build_rag_messages(context, query)
 
-                # 質問原文が user メッセージに含まれていることを検証
-                user_content = rag_messages[1]["content"]
-                if query not in user_content:
-                    raise RuntimeError(
-                        "RAG prompt integrity check failed: original query is not embedded verbatim in user message"
-                    )
-
-                # assistant prefill の先頭をログ
-                prefill = rag_messages[2]["content"]
-                print(
-                    "[rag_ask] prompt_check"
-                    f" query_in_user_msg=True"
-                    f" assistant_prefill={prefill!r}"
-                    f" query_preview={query[:80]!r}",
-                    file=_sys.stderr,
+            user_content = rag_messages[1]["content"]
+            if query not in user_content:
+                raise RuntimeError(
+                    "RAG prompt integrity check failed: original query is not embedded verbatim in user message"
                 )
 
-                try:
-                    async with session.post(
-                        "http://localhost:11434/api/chat",
-                        json={
-                            "model": "gemma3:4b",
-                            "messages": rag_messages,
-                            "stream": False,
-                            "options": {
-                                "num_ctx": 12000,
-                                "num_predict": 1400,
-                                "temperature": 0.08,
-                                "top_k": 15,
-                                "top_p": 0.85,
-                                "repeat_penalty": 1.03,
-                            },
-                        },
-                        timeout=aiohttp.ClientTimeout(total=300),
-                    ) as resp:
-                        if resp.status >= 400:
-                            err_text = await resp.text()
-                            raise RuntimeError(
-                                f"Ollama chat failed: status={resp.status} body={err_text[:400]}"
-                            )
-                        gen_data = await resp.json()
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    error_text = str(exc).lower()
-                    likely_context_overflow = (
-                        "context" in error_text
-                        or "token" in error_text
-                        or "n_ctx" in error_text
-                        or "length" in error_text
-                    )
-                    can_shrink_more = current_limit > MIN_CONTEXT_CHARS
-                    is_last_attempt = attempt >= 2
-                    if not likely_context_overflow or not can_shrink_more or is_last_attempt:
-                        raise
+            prefill = rag_messages[2]["content"]
+            llm_prompt = (
+                f"{rag_messages[0]['content']}\n\n"
+                f"{rag_messages[1]['content']}\n\n"
+                f"{prefill}"
+            )
 
-                    next_limit = max(int(current_limit * 0.7), MIN_CONTEXT_CHARS)
-                    print(
-                        "[rag_ask] context_shrink_retry"
-                        f" attempt={attempt + 1}"
-                        f" char_limit={current_limit} -> {next_limit}"
-                        f" reason={exc}",
-                        file=_sys.stderr,
-                    )
-                    current_limit = next_limit
-                    context_sources = build_context_sources(current_limit)
+            print(
+                "[rag_ask] prompt_check"
+                f" query_in_user_msg=True"
+                f" assistant_prefill={prefill!r}"
+                f" query_preview={query[:80]!r}",
+                file=_sys.stderr,
+            )
 
-        if gen_data is None:
-            raise RuntimeError("Ollama chat response is empty")
+            try:
+                llm_text = await asyncio.to_thread(
+                    _run_llama_with_preset,
+                    llm_prompt,
+                    llm_preset_name,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                error_text = str(exc).lower()
+                likely_context_overflow = (
+                    "context" in error_text
+                    or "token" in error_text
+                    or "n_ctx" in error_text
+                    or "length" in error_text
+                )
+                can_shrink_more = current_limit > MIN_CONTEXT_CHARS
+                is_last_attempt = attempt >= 2
+                if not likely_context_overflow or not can_shrink_more or is_last_attempt:
+                    raise
+
+                next_limit = max(int(current_limit * 0.7), MIN_CONTEXT_CHARS)
+                print(
+                    "[rag_ask] context_shrink_retry"
+                    f" attempt={attempt + 1}"
+                    f" char_limit={current_limit} -> {next_limit}"
+                    f" reason={exc}",
+                    file=_sys.stderr,
+                )
+                current_limit = next_limit
+                context_sources = build_context_sources(current_limit)
+
+        if llm_text is None:
+            raise RuntimeError("llama.cpp response is empty")
 
         included_docs_count = len(context_sources)
-        answer = gen_data.get("message", {}).get("content", "").strip()
+        answer = llm_text.strip()
         # assistant prefill + 生成結果を結合して完全な回答にする
         answer = prefill + answer
 
-        # 実際のトークン使用量をログ（チューニング用）
-        prompt_eval_count = gen_data.get("prompt_eval_count", "?")
-        eval_count = gen_data.get("eval_count", "?")
-        eval_duration_s = gen_data.get("eval_duration", 0) / 1e9
+        # llama-cpp Python API では詳細トークン計測値を常に取得できないため、件数中心でログ出力する。
         print(
             f"[rag_ask] context={total_ctx_chars:,}文字"
             f" retrieved_docs={retrieved_docs_count} included_docs={included_docs_count}"
-            f" prompt_tokens={prompt_eval_count} eval_tokens={eval_count}"
-            f" eval_time={eval_duration_s:.1f}s",
+            f" engine=llama.cpp",
             file=_sys.stderr,
         )
         for title, size in source_char_stats:
             print(f"[rag_ask] source_chars title=【{title}】 chars={size:,}", file=_sys.stderr)
-        # 参照元タイトル一覧（Gemma3へ渡した順序）
+        # 参照元タイトル一覧（Gemmaへ渡した順序）
         sources_list_md = "\n".join([f"- 【{title}】" for title, _ in context_sources])
-        # 参照元Wikipedia本文（Gemma3へ実際に渡した本文をそのまま保存）
+        # 参照元Wikipedia本文（Gemmaへ実際に渡した本文をそのまま保存）
         if is_compare_mode:
             # compare-wiki は回答抽出が主目的のため、巨大な本文保存を省略してI/O負荷を下げる。
             sources_body_md = "（compareモードのため省略）"
@@ -1876,8 +2233,8 @@ async def rag_ask(
             f"- 実使用コンテキスト長: {total_ctx_chars:,}文字\n"
             f"- Wikipedia本文合計: {total_ctx_chars:,}文字\n"
             f"- 参照記事数: {included_docs_count}\n"
-            "- num_ctx: 12000\n"
-            "- num_predict: 1400\n"
+            f"- num_ctx: {int(llm_preset.get('num_ctx', 12000))}\n"
+            f"- num_predict: {int(llm_preset.get('max_tokens', 1400))}\n"
             "- 記事別本文文字数:\n"
             f"{source_char_lines}"
         )

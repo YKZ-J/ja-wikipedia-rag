@@ -19,8 +19,8 @@ Bun MCP Server  (src/interface/http/mcp-server.ts)
     │ spawn
     ├─► Python LLM Bridge  (python/mcp_server.py)
     │       │
-    │       ├─► llama-cpp  Gemma3 (4b-it-qat-q4_0.gguf)  ← 文書生成・要約
-    │       ├─► Ollama      nomic-embed-text               ← クエリ埋め込み
+    │       ├─► llama-cpp   Gemma 2B (.gguf)               ← 文書生成・要約
+    │       ├─► Transformers GTE-multilingual-base         ← クエリ埋め込み
     │       └─► asyncpg    ローカル Supabase               ← ベクター検索
     │
     └─► Vault (Markdown + Git)  ← 生成ドキュメントを保存
@@ -30,16 +30,16 @@ Bun MCP Server  (src/interface/http/mcp-server.ts)
 
 ## コンポーネント一覧
 
-| コンポーネント     | 技術                      | 役割                            |
-| ------------------ | ------------------------- | ------------------------------- |
-| kb CLI             | TypeScript / Bun          | コマンドライン UI               |
-| Bun MCP Server     | @modelcontextprotocol/sdk | HTTP エンドポイント、ツール登録 |
-| Python MCP Server  | FastMCP (stdio)           | LLM・RAG ロジック本体           |
-| Gemma3             | llama-cpp-python (.gguf)  | ドキュメント生成・要約          |
-| nomic-embed-text   | Ollama                    | テキスト埋め込みベクトル生成    |
-| pgvector / IVFFlat | Supabase (local)          | ベクター近傍検索                |
-| Wikipedia DB       | 135万記事                 | RAG 知識ソース                  |
-| Vault              | Markdown + Git            | 生成ドキュメント永続化          |
+| コンポーネント        | 技術                      | 役割                            |
+| --------------------- | ------------------------- | ------------------------------- |
+| kb CLI                | TypeScript / Bun          | コマンドライン UI               |
+| Bun MCP Server        | @modelcontextprotocol/sdk | HTTP エンドポイント、ツール登録 |
+| Python MCP Server     | FastMCP (stdio)           | LLM・RAG ロジック本体           |
+| Gemma 2B              | llama-cpp-python (.gguf)  | ドキュメント生成・要約          |
+| gte-multilingual-base | Transformers + PyTorch    | テキスト埋め込みベクトル生成    |
+| pgvector / IVFFlat    | Supabase (local)          | ベクター近傍検索                |
+| Wikipedia DB          | 135万記事                 | RAG 知識ソース                  |
+| Vault                 | Markdown + Git            | 生成ドキュメント永続化          |
 
 ---
 
@@ -80,13 +80,13 @@ mcp-sever/
 
 ## ローカル環境要件
 
-| 項目       | 推奨                                              |
-| ---------- | ------------------------------------------------- |
-| マシン     | Mac mini M4 / MacBook M 系 (16GB+ RAM)            |
-| OS         | macOS (Apple Silicon)                             |
-| ランタイム | Bun v1.3+, Python 3.12+                           |
-| コンテナ   | OrbStack または Docker Desktop                    |
-| GPU        | Metal (llama-cpp の `n_gpu_layers=-1` で自動使用) |
+| 項目       | 推奨                                    |
+| ---------- | --------------------------------------- |
+| マシン     | Mac mini M4 / MacBook M 系 (16GB+ RAM)  |
+| OS         | macOS (Apple Silicon)                   |
+| ランタイム | Bun v1.3+, Python 3.12+                 |
+| コンテナ   | OrbStack または Docker Desktop          |
+| GPU        | Metal (llama-cpp と PyTorch MPS で利用) |
 
 ---
 
@@ -116,9 +116,6 @@ RAG_DB_QUERY_TIMEOUT_SEC=60
 # 1. Supabase 起動
 supabase start
 
-# 2. Ollama 起動（別ターミナル）
-ollama serve
-
 # 3. Bun MCP サーバー起動（別ターミナル）
 bun run src/interface/http/mcp-server.ts
 
@@ -130,10 +127,11 @@ kb ask-wiki "北海道の観光地について教えて"
 
 ## 関連ドキュメント
 
-| ドキュメント                                   | 内容                                   |
-| ---------------------------------------------- | -------------------------------------- |
-| [kb-commands.md](kb-commands.md)               | kb コマンド一覧                        |
-| [mcp-implementation.md](mcp-implementation.md) | MCP 実装の全容                         |
-| [database-setup.md](database-setup.md)         | データベース初期設定                   |
-| [wikipedia-pipeline.md](wikipedia-pipeline.md) | Wikipedia データ投入・バックアップ手順 |
-| [query-optimization.md](query-optimization.md) | 質問クエリ最適化フロー                 |
+| ドキュメント                                                                                 | 内容                                   |
+| -------------------------------------------------------------------------------------------- | -------------------------------------- |
+| [kb-commands.md](kb-commands.md)                                                             | kb コマンド一覧                        |
+| [mcp-implementation.md](mcp-implementation.md)                                               | MCP 実装の全容                         |
+| [database-setup.md](database-setup.md)                                                       | データベース初期設定                   |
+| [operational/documents-v2-recovery-runbook.md](operational/documents-v2-recovery-runbook.md) | documents_v2 復旧手順（再作成方式）    |
+| [wikipedia-pipeline.md](wikipedia-pipeline.md)                                               | Wikipedia データ投入・バックアップ手順 |
+| [query-optimization.md](query-optimization.md)                                               | 質問クエリ最適化フロー                 |
