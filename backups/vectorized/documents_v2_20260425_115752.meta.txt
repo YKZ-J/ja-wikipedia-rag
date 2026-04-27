@@ -1,8 +1,0 @@
-timestamp_jst=20260425_115752
-database=postgres
-host=127.0.0.1
-port=54325
-user=supabase_admin
-table=public.documents_v2
-row_count=3888094
-e8ac4c8f21e7a0143375325739f26d5d086892a3fe2fac793b730b80af6f8b20  backups/vectorized/documents_v2_20260425_115752.dump

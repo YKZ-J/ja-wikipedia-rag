@@ -372,6 +372,13 @@ def _sanitize_rag_answer_text(text: str) -> str:
     if not cleaned:
         return ""
 
+    # 冒頭に混入しやすい「質問文 + 回答」ヘッダを除去する。
+    cleaned = re.sub(r"^.+?[？?]\s*\n+\s*回答\s*\n+", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"^回答\s*\n+", "", cleaned)
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return ""
+
     blocks = [b.strip() for b in re.split(r"\n{2,}", cleaned) if b.strip()]
     deduped_blocks: list[str] = []
     seen: set[str] = set()
@@ -1240,7 +1247,7 @@ def _merge_ranked_docs(
 
     # タイトル一致は補助シグナル
     for docs in title_lists:
-        add_docs(docs, base=96.0, decay=8.0)
+        add_docs(docs, base=72.0, decay=8.0)
 
     # アンカー語に一致する記事へ追加ボーナスを付与
     for doc_id, doc in doc_by_id.items():
@@ -1299,6 +1306,63 @@ def _collect_relevance_terms(query: str, sub_queries: list[str]) -> list[str]:
             if len(terms) >= 18:
                 return terms
     return terms
+
+
+def _is_tourism_intent_query(text: str) -> bool:
+    """観光スポット系の質問かどうかを判定する。"""
+    return any(
+        keyword in text
+        for keyword in ("観光", "名所", "観光地", "イベント", "祭", "祭り", "春", "花見")
+    )
+
+
+def _select_context_snippet(body: str, max_chars: int = 220) -> str:
+    """本文から短い説明スニペットを抽出する。"""
+    normalized = " ".join(body.replace("\n", " ").split()).strip()
+    if not normalized:
+        return ""
+
+    for sentence in re.split(r"(?<=[。！？!?])\s+", normalized):
+        candidate = sentence.strip()
+        if len(candidate) >= 24:
+            return candidate[:max_chars].rstrip("。") + "。"
+
+    return normalized[:max_chars].rstrip("。") + "。"
+
+
+def _answer_has_context_signals(answer: str, context_sources: list[tuple[str, str]]) -> bool:
+    """回答文が参照コンテキスト由来の語を十分に含むかを判定する。"""
+    if len(answer.strip()) < 80:
+        return False
+
+    title_terms: set[str] = set()
+    for title, _ in context_sources:
+        for token in _RE_JP_KEYWORD.findall(title):
+            if len(token) >= 2 and token not in _GENERIC_SECONDARY_QUERIES:
+                title_terms.add(token)
+        for token in _RE_LATIN_TOKEN.findall(title):
+            if len(token) >= 2:
+                title_terms.add(token)
+
+    if not title_terms:
+        return False
+
+    matched_terms = [term for term in title_terms if term in answer]
+    return len(matched_terms) >= 2
+
+
+def _build_grounded_fallback_answer(query: str, context_sources: list[tuple[str, str]]) -> str:
+    """モデル出力が弱い場合に、参照コンテキストベースで回答を再構成する。"""
+    subject = _extract_subject(query)
+    sections: list[str] = [f"{subject}について、参照資料から確認できる要点は次のとおりです。"]
+
+    for title, body in context_sources:
+        snippet = _select_context_snippet(body)
+        if not snippet:
+            continue
+        sections.append(f"{title}では、{snippet}")
+
+    return "\n\n".join(sections).strip()
 
 
 def _rerank_docs_by_query_relevance(docs: list[dict], query: str, sub_queries: list[str]) -> list[dict]:
@@ -1366,6 +1430,7 @@ async def _retrieve_rag_docs(
     else:
         _, all_vector_queries, all_title_queries, extraction_mode = await _extract_search_queries(query)
     latin_terms = list(dict.fromkeys([token.lower() for token in _RE_LATIN_TOKEN.findall(query)]))
+    is_tourism_query = _is_tourism_intent_query(query)
     subject_terms = set(re.findall(r"の([^の\s、。]{1,20})について", query))
 
     def extract_parallel_subject_terms(text: str) -> list[str]:
@@ -1421,7 +1486,7 @@ async def _retrieve_rag_docs(
                     break
         vector_queries = [all_vector_queries[0], extra_query]
     # 観光/イベント系は地名+意図語の補助ベクトルを1本追加してノイズ耐性を上げる
-    elif any(k in query for k in ("観光", "イベント", "祭", "祭り", "春", "花見")):
+    elif is_tourism_query:
         for candidate in all_vector_queries[1:]:
             if any(k in candidate for k in ("観光", "イベント", "祭", "祭り")):
                 vector_queries = [all_vector_queries[0], candidate]
@@ -1436,6 +1501,9 @@ async def _retrieve_rag_docs(
 
     if vector_query_limit is not None:
         limited = max(1, int(vector_query_limit))
+        if is_tourism_query:
+            # 観光系は地名だけだと誤近傍になりやすいため、補助クエリを最低1本追加する。
+            limited = max(2, limited)
         vector_queries = vector_queries[:limited]
 
     title_candidates = list(dict.fromkeys(all_title_queries))
@@ -1519,11 +1587,38 @@ async def _retrieve_rag_docs(
         title_queries.append(candidate)
 
     title_queries = title_queries[:4] if (latin_terms or parallel_subject_terms) else title_queries[:2]
+
+    # 観光系クエリでは地名単体の前方一致（例: 北海道%）がノイズ化しやすいため除外する。
+    if is_tourism_query and title_queries:
+        filtered_title_queries: list[str] = []
+        for candidate in title_queries:
+            has_intent_token = any(
+                keyword in candidate
+                for keyword in ("観光", "名所", "観光地", "イベント", "祭", "祭り")
+            )
+            if candidate in location_heads and not has_intent_token:
+                continue
+            filtered_title_queries.append(candidate)
+        title_queries = filtered_title_queries
+
     # アンカー語は検索に使わない分も保持して再ランキングで活用
     anchor_terms = [q for q in all_vector_queries[1:4] if q]
     for tq in title_queries:
         if tq and tq not in anchor_terms:
             anchor_terms.append(tq)
+
+    if is_tourism_query and anchor_terms:
+        filtered_anchor_terms = []
+        for term in anchor_terms:
+            has_intent_token = any(
+                keyword in term
+                for keyword in ("観光", "名所", "観光地", "イベント", "祭", "祭り")
+            )
+            if term in location_heads and not has_intent_token:
+                continue
+            filtered_anchor_terms.append(term)
+        if filtered_anchor_terms:
+            anchor_terms = filtered_anchor_terms
 
     async def embed_one(text: str) -> list[float]:
         cached = _lru_get(_embed_cache, text)
@@ -1616,6 +1711,39 @@ async def _retrieve_rag_docs(
         scored_docs.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return [item[2] for item in scored_docs[:10]]
 
+    async def tourism_title_search(pool: "asyncpg.Pool", location: str) -> list[dict]:
+        normalized_location = _normalize_query_term(location)
+        if not normalized_location:
+            return []
+
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH candidates AS (
+                    SELECT article_id, title, content, chunk_index
+                    FROM documents_v2
+                    WHERE title LIKE $1
+                      AND (
+                        title LIKE '%観光%'
+                        OR title LIKE '%名所%'
+                        OR title LIKE '%イベント%'
+                        OR title LIKE '%祭%'
+                      )
+                    LIMIT 96
+                )
+                SELECT DISTINCT ON (article_id)
+                    article_id AS id,
+                    title,
+                    content
+                FROM candidates
+                ORDER BY article_id, chunk_index ASC
+                LIMIT 24
+                """,
+                f"{normalized_location}%",
+            )
+
+        return [{"id": r["id"], "title": r["title"], "content": r["content"]} for r in rows]
+
     async def wrapped_search(task_type: str, coro: "asyncio.Future[list[dict]]") -> tuple[str, list[dict] | None, Exception | None]:
         try:
             result = await coro
@@ -1649,6 +1777,9 @@ async def _retrieve_rag_docs(
             tasks.append(wrapped_search("vector", limited(search_one(pool, emb))))
         for tq in title_queries:
             tasks.append(wrapped_search("title", limited(title_search(pool, tq))))
+        if is_tourism_query:
+            for location in list(location_heads)[:2]:
+                tasks.append(wrapped_search("tourism_title", limited(tourism_title_search(pool, location))))
 
         results = await _asyncio.gather(*tasks)
 
@@ -1697,7 +1828,6 @@ async def _retrieve_rag_docs(
     secondary_vector_lists = vector_lists[1:] if len(vector_lists) > 1 else []
     docs = _merge_ranked_docs(primary_vector_docs, secondary_vector_lists, title_lists, anchor_terms)
 
-    is_tourism_query = any(k in query for k in ("観光", "イベント", "祭", "祭り", "春", "花見"))
     if is_tourism_query and docs:
         anchor_parts = [
             part
@@ -1752,7 +1882,7 @@ def _parse_selected_doc_ids(raw: str) -> list[int]:
 async def rag_rankings(query: str) -> str:
     """質問に対するRAG検索ランキング上位20件をJSONで返す。"""
     db_url: str = get_db_url()
-    use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "1") != "0"
+    use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "0") != "0"
     report_vector_query_limit = int(os.environ.get("RAG_REPORT_VECTOR_QUERY_LIMIT", "1"))
     _, sub_queries, _, extraction_mode, ranked_top20_docs = await _retrieve_rag_docs(
         query,
@@ -1782,7 +1912,7 @@ async def rag_answer_report(query: str, top_k: int = 3) -> str:
     """質問に対するRAG回答と計測情報をJSONで返す（top_kは最大3）。"""
     db_url: str = get_db_url()
     effective_top_k = 3 if top_k <= 0 else min(int(top_k), 3)
-    use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "1") != "0"
+    use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "0") != "0"
     report_vector_query_limit = int(os.environ.get("RAG_REPORT_VECTOR_QUERY_LIMIT", "1"))
 
     search_started = time.perf_counter()
@@ -1888,6 +2018,10 @@ async def rag_answer_report(query: str, top_k: int = 3) -> str:
                 answer = _sanitize_rag_answer_text(prefill + llm_text.strip())
                 if not answer:
                     answer = "回答を生成できませんでした。"
+                elif not _answer_has_context_signals(answer, context_sources):
+                    fallback_answer = _build_grounded_fallback_answer(query, context_sources)
+                    if fallback_answer:
+                        answer = fallback_answer
             except Exception as exc:  # noqa: BLE001
                 answer_error = str(exc)
                 answer = (
@@ -1950,6 +2084,7 @@ def _build_rag_messages(context: str, user_prompt: str) -> list[dict[str, str]]:
         "- 参照資料の情報を最大限引用・活用して回答すること。資料に豊富な情報がある場合は省略せず詳細に記述。\n"
         "- 文字数指定がある場合は必ずその文字数を目安に記述すること。沿革・組織・特色・研究など複数の観点から網羅的に解説。\n"
         "- 箇条書き中心ではなく、段落形式の説明文で記述。\n"
+        "- 参照資料のタイトルに含まれる固有名詞を、回答本文に明示的に含めること。\n"
         "- 逆質問や前置きは不要。\n"
         "- 数学に関しての回答は参照資料にある公式と用語を使うこと。\n"
         "- 参照資料に含まれない事実を創作しないこと。"
@@ -2020,7 +2155,7 @@ async def rag_ask(
         )
     else:
         # ask-wiki は ask-wiki-report と同じ検索条件を使う。
-        use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "1") != "0"
+        use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "0") != "0"
         report_vector_query_limit = int(os.environ.get("RAG_REPORT_VECTOR_QUERY_LIMIT", "1"))
         docs, sub_queries, title_lists, extraction_mode, ranked_top20_docs = await _retrieve_rag_docs(
             query,

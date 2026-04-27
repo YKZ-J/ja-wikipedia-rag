@@ -35,6 +35,10 @@ HNSW を含む dump を使うと、HNSW も復元時に再作成されます。
 （例: `documents_v2_title_pattern_idx` や tuned RPC）も消すため、
 復元直後に対象マイグレーションの再適用が必須です。
 
+また、dump 由来で `UNLOGGED` テーブル/インデックスが復元されるケースがあり、
+この場合は DB/コンテナ再起動でデータ消失が再発します。
+復旧後は必ず `LOGGED` 化チェックを実施してください。
+
 ### 標準コマンド
 
 ```bash
@@ -47,7 +51,74 @@ scripts/restore-documents-v2-from-dump.sh backups/hnsw/documents_v2_hnsw_YYYYMMD
 scripts/restore-documents-v2-from-dump.sh backups/hnsw/documents_v2_hnsw_20260425_180212.dump
 ```
 
-## 3. 復旧後チェック
+## 3. 再発防止（必須）
+
+### 3-1. LOGGED / UNLOGGED を必ず確認する
+
+```bash
+set -a && source .env.local && set +a
+psql "$DATABASE_URL" -Atc "
+SELECT c.relname || '|' || c.relpersistence::text
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname='public'
+  AND c.relname IN ('documents_v2', 'documents_v2_embedding_hnsw_cosine_idx')
+ORDER BY c.relname;
+"
+```
+
+- `p` = LOGGED（永続化対象）
+- `u` = UNLOGGED（再起動で消失しうるため NG）
+
+### 3-2. `u` が出たら即座に修正する
+
+```bash
+psql "$DATABASE_URL" -c "ALTER TABLE public.documents_v2 SET LOGGED;"
+```
+
+上記が完了したら、`3-1` を再実行して `documents_v2` / `documents_v2_embedding_hnsw_cosine_idx` がともに `p` であることを確認します。
+
+### 3-3. 永続化テストは `docker restart` で行う
+
+`supabase stop/start` はローカル環境初期化の影響を受ける場合があるため、
+永続化検証では DB コンテナ再起動を使います。
+
+```bash
+# 再起動前の基準値
+psql "$DATABASE_URL" -Atc "SELECT COUNT(*) || '|' || COALESCE(MIN(id),0) || '|' || COALESCE(MAX(id),0) FROM documents_v2;"
+psql "$DATABASE_URL" -Atc "
+WITH s AS (
+  SELECT id, article_id, chunk_index FROM documents_v2 ORDER BY id ASC LIMIT 1000
+), t AS (
+  SELECT id, article_id, chunk_index FROM documents_v2 ORDER BY id DESC LIMIT 1000
+)
+SELECT
+  (SELECT md5(string_agg(id::text || ':' || article_id || ':' || chunk_index::text, ',' ORDER BY id)) FROM s)
+  || '|' ||
+  (SELECT md5(string_agg(id::text || ':' || article_id || ':' || chunk_index::text, ',' ORDER BY id DESC)) FROM t);
+"
+
+# DB コンテナ再起動
+docker restart supabase_db_mcp-sever
+
+# 再起動後に同じ値が一致すること
+psql "$DATABASE_URL" -Atc "SELECT COUNT(*) || '|' || COALESCE(MIN(id),0) || '|' || COALESCE(MAX(id),0) FROM documents_v2;"
+psql "$DATABASE_URL" -Atc "
+WITH s AS (
+  SELECT id, article_id, chunk_index FROM documents_v2 ORDER BY id ASC LIMIT 1000
+), t AS (
+  SELECT id, article_id, chunk_index FROM documents_v2 ORDER BY id DESC LIMIT 1000
+)
+SELECT
+  (SELECT md5(string_agg(id::text || ':' || article_id || ':' || chunk_index::text, ',' ORDER BY id)) FROM s)
+  || '|' ||
+  (SELECT md5(string_agg(id::text || ':' || article_id || ':' || chunk_index::text, ',' ORDER BY id DESC)) FROM t);
+"
+```
+
+一致しない場合は復旧を完了扱いにしないこと。
+
+## 4. 復旧後チェック
 
 ```bash
 set -a && source .env.local && set +a
@@ -61,7 +132,7 @@ psql "$DATABASE_URL" -c "SELECT indexname FROM pg_indexes WHERE schemaname='publ
 MCP_SERVER_URL=http://localhost:3338 kb ask-wiki-report "北海道の観光名所を教えて"
 ```
 
-## 4. 備考
+## 5. 備考
 
 - 再作成方式は復元の再現性が高い反面、HNSW 作成時間が必要です。
 - 迅速復旧が優先なら data-only 方式も選べますが、運用の標準は再作成方式とします。
