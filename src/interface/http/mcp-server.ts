@@ -38,7 +38,8 @@ function createMcpServer(): McpServer {
     "create_doc_wiki",
     {
       title: "Wikipedia ドキュメント生成",
-      description: "Wikipedia から情報を取得して Vault に Markdown ドキュメントを保存する",
+      description:
+        "Wikipedia から情報を取得して Vault に Markdown ドキュメントを保存する",
       inputSchema: {
         title: z.string().min(1).describe("Wikipedia 検索キーワード"),
         tags: z.array(z.string()).optional().describe("タグリスト"),
@@ -99,12 +100,21 @@ function createMcpServer(): McpServer {
         "ローカル Wikipedia vectorDB を検索し、回答と検索/回答時間やtop_k取得内容をJSONで返す",
       inputSchema: {
         query: z.string().min(1).describe("質問文字列"),
-        topK: z.number().int().min(1).max(3).optional().describe("取得件数（固定3推奨）"),
+        topK: z
+          .number()
+          .int()
+          .min(1)
+          .max(3)
+          .optional()
+          .describe("取得件数（固定3推奨）"),
       },
     },
     async ({ query, topK = 3 }) => {
       console.log(`[MCP] ask_wiki_rag_report: "${query}" topK=${topK}`);
-      const report = await runPythonRAGReport(query, Math.min(3, Math.max(1, topK)));
+      const report = await runPythonRAGReport(
+        query,
+        Math.min(3, Math.max(1, topK)),
+      );
       return jsonText(report);
     },
   );
@@ -129,16 +139,27 @@ function createMcpServer(): McpServer {
       console.log(`[MCP] create_wiki_rag_comparison: "${query}"`);
       const maxSelectedForCompare = Math.max(
         1,
-        Number.parseInt(process.env.KB_COMPARE_WIKI_MAX_SELECTED_DOCS ?? "4", 10) || 4,
+        Number.parseInt(
+          process.env.KB_COMPARE_WIKI_MAX_SELECTED_DOCS ?? "4",
+          10,
+        ) || 4,
       );
-      const selectedDocIdsForCompare = selectedDocIds.slice(0, maxSelectedForCompare);
+      const selectedDocIdsForCompare = selectedDocIds.slice(
+        0,
+        maxSelectedForCompare,
+      );
       const filePath = await createRagComparisonDoc({
         query,
         title,
         tags,
-        createRagDoc: (q, t) => runPythonRAGDoc(q, t, selectedDocIdsForCompare, "compare"),
-        createWikiDoc: (keyword, wikiTags) => createDocFromWikipedia({ keyword, tags: wikiTags }),
-        summarize: (prompt) => runPythonSummaryWithMode(prompt, "compare_non_rag_light"),
+        createRagDoc: (q, t) =>
+          runPythonRAGDoc(q, t, selectedDocIdsForCompare, "compare"),
+        createRagReport: (q, topK = 3) =>
+          runPythonRAGReport(q, Math.min(3, Math.max(1, topK))),
+        createWikiDoc: (keyword, wikiTags) =>
+          createDocFromWikipedia({ keyword, tags: wikiTags }),
+        summarize: (prompt) =>
+          runPythonSummaryWithMode(prompt, "compare_non_rag_light"),
       });
       console.log(`[MCP] Generated comparison: ${filePath}`);
       return jsonText({ file: filePath });

@@ -9,13 +9,38 @@ type CreateRagComparisonInput = {
   title?: string;
   tags?: string[];
   createRagDoc: (query: string, tags?: string[]) => Promise<string>;
+  createRagReport: (
+    query: string,
+    topK?: number,
+  ) => Promise<{
+    search_time_ms: number;
+    answer_time_ms: number;
+    total_time_ms: number;
+    answer_error: string;
+    runtime_parameters: {
+      model_path: string;
+      llm_preset: string;
+      max_context_chars: number;
+      content_preview_chars: number;
+      effective_top_k: number;
+      llm_params: {
+        max_tokens: number;
+        temperature: number;
+        top_k: number;
+        repeat_penalty: number;
+      };
+    };
+  }>;
   createWikiDoc: (keyword: string, tags?: string[]) => Promise<string>;
   summarize: (prompt: string) => Promise<string>;
 };
 
-const DEFAULT_IMAGE = "https://ytzmpefdjnd1ueff.public.blob.vercel-storage.com/blog.webp";
+const DEFAULT_IMAGE =
+  "https://ytzmpefdjnd1ueff.public.blob.vercel-storage.com/blog.webp";
 
-function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
+function firstNonEmpty(
+  ...values: Array<string | undefined>
+): string | undefined {
   for (const value of values) {
     if (value?.trim()) {
       return value.trim();
@@ -42,7 +67,10 @@ function dedupe(items: string[]): string[] {
   return Array.from(new Set(items.map((item) => item.trim()).filter(Boolean)));
 }
 
-function parseEnabledFlag(value: string | undefined, defaultValue: boolean): boolean {
+function parseEnabledFlag(
+  value: string | undefined,
+  defaultValue: boolean,
+): boolean {
   if (!value) return defaultValue;
   const normalized = value.trim().toLowerCase();
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
@@ -84,7 +112,7 @@ function extractRagAnswer(markdown: string): string {
 
 function extractSearchQueries(markdown: string): string[] {
   const section = markdown.match(
-    /(?:^|\n)#\s*検索クエリ\s*\(実際に使用\)\s*\n([\s\S]*?)(?:\n#\s*参照元|\s*$)/,
+    /(?:^|\n)#\s*検索クエリ\s*\(実際に使用\)\s*\n([\s\S]*?)(?:\n#\s*|\s*$)/,
   );
 
   if (!section?.[1]) return [];
@@ -95,6 +123,63 @@ function extractSearchQueries(markdown: string): string[] {
     .filter((line) => line.startsWith("-"))
     .map((line) => line.replace(/^-\s*/, "").replace(/^`|`$/g, "").trim())
     .filter(Boolean);
+}
+
+function buildAskWikiReportCompatibleParams(report: {
+  search_time_ms: number;
+  answer_time_ms: number;
+  total_time_ms: number;
+  answer_error: string;
+  runtime_parameters: {
+    model_path: string;
+    llm_preset: string;
+    max_context_chars: number;
+    content_preview_chars: number;
+    effective_top_k: number;
+    llm_params: {
+      max_tokens: number;
+      temperature: number;
+      top_k: number;
+      repeat_penalty: number;
+    };
+  };
+}): string[] {
+  const answerError = report.answer_error?.trim()
+    ? report.answer_error
+    : "(none)";
+
+  return [
+    "# Timings",
+    `- search_time_ms: ${report.search_time_ms}`,
+    `- answer_time_ms: ${report.answer_time_ms}`,
+    `- total_time_ms: ${report.total_time_ms}`,
+    `- answer_error: ${answerError}`,
+    "# Runtime Parameters",
+    `- model_path: ${report.runtime_parameters.model_path}`,
+    `- llm_preset: ${report.runtime_parameters.llm_preset}`,
+    `- max_context_chars: ${report.runtime_parameters.max_context_chars}`,
+    `- content_preview_chars: ${report.runtime_parameters.content_preview_chars}`,
+    `- effective_top_k: ${report.runtime_parameters.effective_top_k}`,
+    `- llm.max_tokens: ${report.runtime_parameters.llm_params.max_tokens}`,
+    `- llm.temperature: ${report.runtime_parameters.llm_params.temperature}`,
+    `- llm.top_k: ${report.runtime_parameters.llm_params.top_k}`,
+    `- llm.repeat_penalty: ${report.runtime_parameters.llm_params.repeat_penalty}`,
+  ];
+}
+
+function extractSourceBodies(markdown: string): string {
+  const section = markdown.match(
+    /(?:^|\n)#\s*参照元\s*Wikipedia\s*本文\s*\n([\s\S]*?)\s*$/,
+  );
+
+  if (!section?.[1]) return "";
+  return section[1].trim();
+}
+
+function toQuotedBlockPreserveIndent(lines: string[]): string {
+  return lines
+    .map((line) => (line.length === 0 ? ">" : `> ${line}`))
+    .join("\n");
 }
 
 function extractWikipediaTitles(markdown: string): string[] {
@@ -142,9 +227,19 @@ function createArticleBody(params: {
   ragAnswer: string;
   nonRagAnswer: string;
   ragQueries: string[];
+  ragReportParams: string[];
   wikiTitles: string[];
+  ragSourceBodies: string;
 }): string {
-  const { query, ragAnswer, nonRagAnswer, ragQueries, wikiTitles } = params;
+  const {
+    query,
+    ragAnswer,
+    nonRagAnswer,
+    ragQueries,
+    ragReportParams,
+    wikiTitles,
+    ragSourceBodies,
+  } = params;
 
   const ragLines = [
     "---",
@@ -161,11 +256,27 @@ function createArticleBody(params: {
     "",
     "**検索クエリ（実際に使用）**",
     "",
-    ...(ragQueries.length > 0 ? ragQueries.map((item) => `- \`${item}\``) : ["- （取得なし）"]),
+    ...(ragQueries.length > 0
+      ? ragQueries.map((item) => `- \`${item}\``)
+      : ["- （取得なし）"]),
+    ...(ragReportParams.length > 0
+      ? [
+          "",
+          "**パラメータ一覧（ask-wiki-report互換）**",
+          "",
+          ...ragReportParams,
+        ]
+      : []),
     "",
     "**参照元 Wikipedia 一覧**",
     "",
-    ...(wikiTitles.length > 0 ? wikiTitles.map((item) => `- 【${item}】`) : ["- （取得なし）"]),
+    ...(wikiTitles.length > 0
+      ? wikiTitles.map((item) => `- 【${item}】`)
+      : ["- （取得なし）"]),
+    "",
+    "**参照元 Wikipedia 本文**",
+    "",
+    ...(ragSourceBodies ? ragSourceBodies.split("\n") : ["（取得なし）"]),
     "",
     "---",
   ];
@@ -217,7 +328,7 @@ wikipediaダンプ: jawiki-latest-pages-articles.xml.bz2 04-Mar-2026 01:54 45920
 
 ## ① RAGあり出力（Gemma3 + Wikipedia RAG）
 
-${toQuotedBlock(ragLines)}
+${toQuotedBlockPreserveIndent(ragLines)}
 
 ## ② RAGなし出力（Gemma3 単体）
 
@@ -235,6 +346,7 @@ export async function createRagComparisonDoc({
   title,
   tags = [],
   createRagDoc,
+  createRagReport,
   createWikiDoc,
   summarize,
 }: CreateRagComparisonInput): Promise<string> {
@@ -247,7 +359,10 @@ export async function createRagComparisonDoc({
   const ragMarkdown = await readFile(ragFilePath, "utf-8");
   const ragAnswer = extractRagAnswer(ragMarkdown);
   const ragQueries = extractSearchQueries(ragMarkdown);
+  const ragReport = await createRagReport(trimmedQuery, 3);
+  const ragReportParams = buildAskWikiReportCompatibleParams(ragReport);
   const wikiTitles = extractWikipediaTitles(ragMarkdown);
+  const ragSourceBodies = extractSourceBodies(ragMarkdown);
 
   const stageGapMs = Math.max(
     0,
@@ -268,18 +383,25 @@ export async function createRagComparisonDoc({
   );
   const sourceWikiConcurrency = Math.max(
     1,
-    Number.parseInt(process.env.KB_COMPARE_WIKI_SOURCE_CONCURRENCY ?? "1", 10) || 1,
+    Number.parseInt(
+      process.env.KB_COMPARE_WIKI_SOURCE_CONCURRENCY ?? "1",
+      10,
+    ) || 1,
   );
   const limitedWikiTitles = wikiTitles.slice(0, maxSourceWikiDocs);
 
   const wikiSourceTags = dedupe(["wikipedia", "source", ...tags]);
   const sourceSlugs = generateSourceDocs
     ? (
-        await mapWithConcurrency(limitedWikiTitles, sourceWikiConcurrency, async (wikiTitle) => {
-          const wikiPath = await createWikiDoc(wikiTitle, wikiSourceTags);
-          const wikiMarkdown = await readFile(wikiPath, "utf-8");
-          return extractSlugFromMarkdown(wikiMarkdown);
-        })
+        await mapWithConcurrency(
+          limitedWikiTitles,
+          sourceWikiConcurrency,
+          async (wikiTitle) => {
+            const wikiPath = await createWikiDoc(wikiTitle, wikiSourceTags);
+            const wikiMarkdown = await readFile(wikiPath, "utf-8");
+            return extractSlugFromMarkdown(wikiMarkdown);
+          },
+        )
       ).filter(Boolean)
     : [];
 
@@ -287,12 +409,15 @@ export async function createRagComparisonDoc({
     await new Promise<void>((resolve) => setTimeout(resolve, stageGapMs));
   }
 
-  const nonRagAnswer = normalizeWhitespace(await summarize(buildNonRagPrompt(trimmedQuery)));
+  const nonRagAnswer = normalizeWhitespace(
+    await summarize(buildNonRagPrompt(trimmedQuery)),
+  );
 
   const articleSlug = buildComparisonSlug();
   const today = getTokyoDateString();
   const articleTitle =
-    title?.trim() || `RAGで変わるローカルLLMの出力精度比較検証 (${trimmedQuery})`;
+    title?.trim() ||
+    `RAGで変わるローカルLLMの出力精度比較検証 (${trimmedQuery})`;
   const articleSummary =
     "ローカルLLM（Gemma3）にRAGを組み合わせた出力とRAGなし出力を比較する自動生成レポートです。";
   const safeTitle = articleTitle.replace(/"/g, "'");
@@ -322,7 +447,9 @@ export async function createRagComparisonDoc({
     ragAnswer,
     nonRagAnswer,
     ragQueries,
+    ragReportParams,
     wikiTitles,
+    ragSourceBodies,
   });
 
   const outputDir = resolveOutputDir();
