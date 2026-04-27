@@ -62,16 +62,41 @@ export type WikiRagReport = {
   answer: string;
   runtime_parameters: {
     model_path: string;
+    llm_model?: string;
+    llm_context_window?: number;
+    llm_threads?: number;
+    llm_gpu_layers?: number;
+    llm_batch_size?: number;
     llm_preset: string;
     max_context_chars: number;
     content_preview_chars: number;
     effective_top_k: number;
+    db_empty_detected?: boolean;
+    low_relevance_detected?: boolean;
+    extraction_mode_forced_rule_based?: boolean;
+    vector_query_limit?: number;
+    rag_vector_match_count?: number;
+    rag_vector_oversampling?: number;
+    rag_db_max_concurrency?: number;
+    rag_db_query_timeout_sec?: number;
+    rag_embed_cache_max?: number;
+    query_normalization_timeout_sec?: number;
+    query_normalization_num_predict?: number;
+    embedding_model?: string;
+    embedding_batch_size?: number;
+    embedding_max_length?: number;
     llm_params: {
       max_tokens: number;
       temperature: number;
       top_k: number;
       repeat_penalty: number;
     };
+  };
+  llm_prompt?: {
+    system: string;
+    user: string;
+    assistant_prefill: string;
+    full_prompt: string;
   };
   context_chunk_sizes: Array<{
     rank: number;
@@ -230,12 +255,16 @@ export async function askWikiRag(
   }
 }
 
-export async function askWikiRagReport(query: string, topK = 3): Promise<WikiRagReportResponse> {
+export async function askWikiRagReport(
+  query: string,
+  topK = 3,
+  selectedDocIds: number[] = [],
+): Promise<WikiRagReportResponse> {
   try {
     const timeoutMs = Number(process.env.KB_RAG_REPORT_TIMEOUT_MS || "900000");
     const data = (await callTool(
       "ask_wiki_rag_report",
-      { query, topK },
+      { query, topK, selectedDocIds },
       timeoutMs,
     )) as WikiRagReport;
     return { ok: true, ...data };

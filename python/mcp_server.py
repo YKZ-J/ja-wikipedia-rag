@@ -108,7 +108,6 @@ _RE_DETAIL_SPEC = re.compile(
 )
 _RE_LATIN_TOKEN = re.compile(r"[a-zA-Z]{2,16}")
 _RE_GROUNDED_TOKEN = re.compile(r"[A-Za-z0-9\u3040-\u30ff\u4e00-\u9fff]{2,30}")
-_RE_TITLE_BOUNDARY_TEMPLATE = r"(^|[\s\-・/()\[\]{}（）「」『』])%s($|[\s\-・/()\[\]{}（）「」『』])"
 # フォールバック抽出は漢字/カタカナ中心に限定してノイズを抑える
 # ひらがな語は「〜の」「〜について」抽出側で拾う
 _RE_JP_KEYWORD = re.compile(r"[\u30a0-\u30ff\u4e00-\u9fff]{1,14}")
@@ -372,6 +371,13 @@ def _sanitize_rag_answer_text(text: str) -> str:
     if not cleaned:
         return ""
 
+    # 冒頭に混入しやすい「質問文 + 回答」ヘッダを除去する。
+    cleaned = re.sub(r"^.+?[？?]\s*\n+\s*回答\s*\n+", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"^回答\s*\n+", "", cleaned)
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return ""
+
     blocks = [b.strip() for b in re.split(r"\n{2,}", cleaned) if b.strip()]
     deduped_blocks: list[str] = []
     seen: set[str] = set()
@@ -629,13 +635,12 @@ async def _is_documents_v2_empty(db_url: str) -> bool:
         return False
 
 
-def _extract_search_queries_rule_based(query: str) -> tuple[str, list[str], list[str]]:
+def _extract_search_queries_rule_based(query: str) -> tuple[str, list[str]]:
     """質問文から検索クエリを抽出する。
 
     Returns:
         search_base: 指示語除去後の質問（補助クエリ生成用）
         vector_queries: ベクトル検索に使うクエリ（先頭は必ず質問全文そのまま）
-        title_queries: タイトル一致検索に使う補助クエリ
     """
     import re as _re
 
@@ -654,7 +659,6 @@ def _extract_search_queries_rule_based(query: str) -> tuple[str, list[str], list
     # 先頭クエリはユーザー質問を無加工でそのまま使う（Gemma への質問と同一）。
     # 補助クエリのみ search_base から生成する。
     vector_queries: list[str] = [query]
-    title_queries: list[str] = []
 
     nouns_nitsuite = _re.findall(
         r"([\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]{1,14})\u306b\u3064\u3044\u3066",
@@ -677,13 +681,11 @@ def _extract_search_queries_rule_based(query: str) -> tuple[str, list[str], list
         # python/config/single_kanji_whitelist.json で管理
         return term in _SINGLE_KANJI_SET
 
-    def add_query_term(term: str, with_title: bool = True) -> None:
+    def add_query_term(term: str) -> None:
         if term in seen:
             return
         seen.add(term)
         vector_queries.append(term)
-        if with_title:
-            title_queries.append(term)
 
     def add_latin_variants() -> None:
         """英字略語をタイトル検索しやすい語へ展開する。"""
@@ -761,15 +763,15 @@ def _extract_search_queries_rule_based(query: str) -> tuple[str, list[str], list
         if left in _GENERIC_SECONDARY_QUERIES:
             continue
         if right in {"観光名所", "観光地", "名所", "観光名称"}:
-            add_query_term(f"{left} 観光地", with_title=False)
-            add_query_term(f"{left} 観光", with_title=False)
+            add_query_term(f"{left} 観光地")
+            add_query_term(f"{left} 観光")
         if right in {"観光名", "イベント"}:
             add_query_term(f"{left} {right}")
             if right == "観光名":
                 add_query_term(f"{left} 観光名所")
                 add_query_term(f"{left} 観光地")
             if right == "イベント":
-                add_query_term(f"{left} 観光", with_title=False)
+                add_query_term(f"{left} 観光")
 
     # 「Xの〜観光/イベント/祭り」形式は、地名・主題を組み合わせた補助語を追加する
     has_tourism_intent = any(k in search_base for k in ("観光", "イベント", "祭", "祭り"))
@@ -829,9 +831,8 @@ def _extract_search_queries_rule_based(query: str) -> tuple[str, list[str], list
 
     vector_tail = sorted(vector_queries[1:], key=_priority, reverse=True)
     prioritized_vector_queries = [vector_queries[0], *vector_tail][:5]
-    prioritized_title_queries = sorted(title_queries, key=_priority, reverse=True)[:4]
 
-    return search_base, prioritized_vector_queries, prioritized_title_queries
+    return search_base, prioritized_vector_queries
 
 
 def _normalize_query_term(term: str) -> str:
@@ -1014,67 +1015,7 @@ def _ensure_primary_query_first(
     return out[:6]
 
 
-def _title_boundary_match(title: str, noun: str) -> bool:
-    """タイトル内で noun が単語境界に近い形で一致するかを判定する。"""
-    if not noun:
-        return False
-    pattern = _RE_TITLE_BOUNDARY_TEMPLATE % re.escape(noun)
-    return bool(re.search(pattern, title))
-
-
-def _contains_noisy_affix(title: str, noun: str) -> bool:
-    """`noun` が他語の一部として連結されるノイズ一致を検出する。"""
-    if not noun or noun not in title:
-        return False
-    for idx in range(len(title)):
-        pos = title.find(noun, idx)
-        if pos == -1:
-            break
-        end = pos + len(noun)
-        prev_char = title[pos - 1] if pos > 0 else ""
-        next_char = title[end] if end < len(title) else ""
-        prev_is_boundary = (not prev_char) or bool(
-            re.match(r"[\s\-・/()\[\]{}（）「」『』]", prev_char)
-        )
-        next_is_boundary = (not next_char) or bool(
-            re.match(r"[\s\-・/()\[\]{}（）「」『』]", next_char)
-        )
-        if not (prev_is_boundary or next_is_boundary):
-            return True
-        idx = pos + 1
-    return False
-
-
-def _score_title_match(title: str, noun: str) -> float:
-    """タイトル一致の質をスコア化する。部分一致ノイズを下げる。"""
-    if not noun:
-        return 0.0
-
-    score = 0.0
-    if title == noun:
-        score += 200.0
-    elif title == f"{noun}一覧":
-        score += 190.0
-    elif _title_boundary_match(title, noun):
-        score += 150.0
-    elif noun in title:
-        score += 85.0
-
-    if title.startswith(noun):
-        score += 16.0
-    if title.endswith(noun):
-        score += 16.0
-
-    if _contains_noisy_affix(title, noun):
-        score -= 55.0
-
-    if any(sym in title for sym in ("!", "！", "?", "？")):
-        score -= 12.0
-
-    return score
-
-
-async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str], list[str]]:
+async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]]:
     """Gemma で質問整形を行い、検索クエリ候補を返す。"""
     prompt = (
         "あなたはWikipedia検索用のクエリ整形アシスタントです。\n"
@@ -1083,11 +1024,10 @@ async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]
         "要件:\n"
         "- search_base: 質問の要点を保った短い検索文（日本語、120文字以内）\n"
         "- vector_queries: ベクトル検索用クエリ配列\n"
-        "- title_queries: タイトル一致検索向け配列\n"
-        "- vector_queries/title_queriesに質問に含まれる固有名詞と、その同義語・正式名称をできるだけ入れる。通称・略称は正式名称へ正規化したものも入れる（例: 首相→内閣総理大臣）\n"
+        "- vector_queriesに質問に含まれる固有名詞と、その同義語・正式名称をできるだけ入れる。通称・略称は正式名称へ正規化したものも入れる（例: 首相→内閣総理大臣）\n"
         "- 文字数指定や『詳しく』『教えて』などの依頼語は除去する\n"
         "JSONスキーマ:\n"
-        '{"search_base":"string","vector_queries":["string"],"title_queries":["string"]}\n\n'
+        '{"search_base":"string","vector_queries":["string"]}\n\n'
         f"今回のWikipedia検索用のクエリ整形対象の質問: {query}\n"
     )
 
@@ -1131,8 +1071,8 @@ async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]
             f"(done_reason={done_reason}, preview={preview!r})"
         )
 
-    rb_search_base, rb_vector_queries, rb_title_queries = _extract_search_queries_rule_based(query)
-    grounding_tokens = _collect_grounding_tokens(query, [rb_search_base, *rb_vector_queries, *rb_title_queries])
+    rb_search_base, rb_vector_queries = _extract_search_queries_rule_based(query)
+    grounding_tokens = _collect_grounding_tokens(query, [rb_search_base, *rb_vector_queries])
 
     search_base_raw = str(parsed.get("search_base", "")).strip()
     search_base = _normalize_query_term(search_base_raw) or _normalize_query_term(query)
@@ -1142,9 +1082,7 @@ async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]
     )
 
     vector_raw = parsed.get("vector_queries")
-    title_raw = parsed.get("title_queries")
     vector_candidates = vector_raw if isinstance(vector_raw, list) else []
-    title_candidates = title_raw if isinstance(title_raw, list) else []
 
     vector_queries: list[str] = []
     vector_seed = _expand_canonical_variants([search_base, *vector_candidates, query])
@@ -1169,67 +1107,51 @@ async def _extract_search_queries_with_gemma(query: str) -> tuple[str, list[str]
             continue
         vector_queries.append(term)
 
-    title_queries: list[str] = []
-    title_seed = _expand_canonical_variants([search_base, *title_candidates])
-    for candidate in title_seed:
-        if not isinstance(candidate, str):
-            continue
-        term = _sanitize_grounded_phrase(candidate, grounding_tokens)
-        if not term:
-            continue
-        if not _is_grounded_term(term, grounding_tokens):
-            continue
-        if term in title_queries:
-            continue
-        title_queries.append(term)
-        if len(title_queries) >= 6:
-            break
-
-    for candidate in rb_title_queries:
-        if len(title_queries) >= 6:
-            break
-        term = _normalize_query_term(candidate)
-        if not term or term in title_queries:
-            continue
-        title_queries.append(term)
-
     if not vector_queries:
         vector_queries = [search_base or _normalize_query_term(rb_search_base)]
 
     vector_queries = _ensure_primary_query_first(query, vector_queries, search_base)
 
-    return search_base, vector_queries, title_queries
+    return search_base, vector_queries
 
 
-async def _extract_search_queries(query: str) -> tuple[str, list[str], list[str], str]:
+async def _extract_search_queries(query: str) -> tuple[str, list[str], str]:
     """検索クエリ抽出。Gemmaを優先し、失敗時はルールベースへフォールバックする。"""
     try:
         extracted = await _extract_search_queries_with_gemma(query)
         print("[_extract_search_queries] mode=gemma_json", file=sys.stderr)
-        return extracted[0], extracted[1], extracted[2], "gemma_json"
+        return extracted[0], extracted[1], "gemma_json"
     except Exception as exc:  # noqa: BLE001
         print(f"[_extract_search_queries] fallback to rule-based: {exc}", file=sys.stderr)
         extracted = _extract_search_queries_rule_based(query)
         print("[_extract_search_queries] mode=rule_based_fallback", file=sys.stderr)
-        return extracted[0], extracted[1], extracted[2], "rule_based_fallback"
+        return extracted[0], extracted[1], "rule_based_fallback"
 
 
 def _merge_ranked_docs(
     primary_vector_docs: list[dict],
     secondary_vector_lists: list[list[dict]],
-    title_lists: list[list[dict]],
     anchor_terms: list[str],
 ) -> list[dict]:
     """複数検索結果をスコアリングして統合する。"""
-    score_by_id: dict[int, float] = {}
-    doc_by_id: dict[int, dict] = {}
+    score_by_key: dict[str, float] = {}
+    doc_by_key: dict[str, dict] = {}
+
+    def _doc_key(doc: dict) -> str:
+        article_id = int(doc["id"])
+        chunk_index = doc.get("chunk_index")
+        if chunk_index is not None:
+            return f"{article_id}:{int(chunk_index)}"
+        # chunk_index が無い既存データとの互換用
+        content = str(doc.get("content", ""))
+        return f"{article_id}:legacy:{hash(content)}"
 
     def add_docs(docs: list[dict], base: float, decay: float) -> None:
         for rank, doc in enumerate(docs):
-            doc_id = int(doc["id"])
+            key = _doc_key(doc)
             score = base - rank * decay
-            score_by_id[doc_id] = score_by_id.get(doc_id, 0.0) + score
-            doc_by_id[doc_id] = doc
+            score_by_key[key] = score_by_key.get(key, 0.0) + score
+            doc_by_key[key] = doc
 
     # 質問全文ベクトル検索を主軸にする
     add_docs(primary_vector_docs, base=82.0, decay=4.0)
@@ -1238,12 +1160,8 @@ def _merge_ranked_docs(
     for docs in secondary_vector_lists:
         add_docs(docs, base=38.0, decay=2.0)
 
-    # タイトル一致は補助シグナル
-    for docs in title_lists:
-        add_docs(docs, base=96.0, decay=8.0)
-
     # アンカー語に一致する記事へ追加ボーナスを付与
-    for doc_id, doc in doc_by_id.items():
+    for key, doc in doc_by_key.items():
         title = doc["title"]
         content_head = doc["content"][:1200]
         bonus = 0.0
@@ -1257,10 +1175,10 @@ def _merge_ranked_docs(
                 elif part in content_head:
                     bonus += 3.5
         if bonus:
-            score_by_id[doc_id] = score_by_id.get(doc_id, 0.0) + bonus
+            score_by_key[key] = score_by_key.get(key, 0.0) + bonus
 
-    ranked_ids = sorted(score_by_id.keys(), key=lambda doc_id: score_by_id[doc_id], reverse=True)
-    return [doc_by_id[doc_id] for doc_id in ranked_ids]
+    ranked_keys = sorted(score_by_key.keys(), key=lambda k: score_by_key[k], reverse=True)
+    return [doc_by_key[key] for key in ranked_keys]
 
 
 def _collect_relevance_terms(query: str, sub_queries: list[str]) -> list[str]:
@@ -1299,6 +1217,134 @@ def _collect_relevance_terms(query: str, sub_queries: list[str]) -> list[str]:
             if len(terms) >= 18:
                 return terms
     return terms
+
+
+def _is_tourism_intent_query(text: str) -> bool:
+    """観光スポット系の質問かどうかを判定する。"""
+    return any(
+        keyword in text
+        for keyword in ("観光", "名所", "観光地", "イベント", "祭", "祭り", "春", "花見")
+    )
+
+
+def _select_context_snippet(body: str, max_chars: int = 220) -> str:
+    """本文から短い説明スニペットを抽出する。"""
+    normalized = " ".join(body.replace("\n", " ").split()).strip()
+    if not normalized:
+        return ""
+
+    for sentence in re.split(r"(?<=[。！？!?])\s+", normalized):
+        candidate = sentence.strip()
+        if len(candidate) >= 24:
+            return candidate[:max_chars].rstrip("。") + "。"
+
+    return normalized[:max_chars].rstrip("。") + "。"
+
+
+def _answer_has_context_signals(answer: str, context_sources: list[tuple[str, str]]) -> bool:
+    """回答文が参照コンテキスト由来の語を十分に含むかを判定する。"""
+    if len(answer.strip()) < 80:
+        return False
+
+    title_terms: set[str] = set()
+    for title, _ in context_sources:
+        for token in _RE_JP_KEYWORD.findall(title):
+            if len(token) >= 2 and token not in _GENERIC_SECONDARY_QUERIES:
+                title_terms.add(token)
+        for token in _RE_LATIN_TOKEN.findall(title):
+            if len(token) >= 2:
+                title_terms.add(token)
+
+    if not title_terms:
+        return False
+
+    matched_terms = [term for term in title_terms if term in answer]
+    return len(matched_terms) >= 2
+
+
+def _build_grounded_fallback_answer(query: str, context_sources: list[tuple[str, str]]) -> str:
+    """モデル出力が弱い場合に、参照コンテキストベースで回答を再構成する。"""
+    subject = _extract_subject(query)
+    sections: list[str] = [f"{subject}について、参照資料から確認できる要点は次のとおりです。"]
+
+    for title, body in context_sources:
+        snippet = _select_context_snippet(body)
+        if not snippet:
+            continue
+        sections.append(f"{title}では、{snippet}")
+
+    return "\n\n".join(sections).strip()
+
+
+def _build_prime_minister_tenure_answer(
+    query: str,
+    context_sources: list[tuple[str, str]],
+) -> str:
+    """首相の在任期間ランキング質問に対し、参照本文から候補を抽出して回答を構築する。"""
+    if not (
+        "首相" in query
+        and "任期" in query
+        and "長い順" in query
+    ):
+        return ""
+
+    top_n = 5
+    m = re.search(r"(\d{1,2})人", query)
+    if m:
+        top_n = max(1, min(10, int(m.group(1))))
+
+    # 例: 森喜朗2000年 ... 2001年 のような表記を抽出する
+    pattern = re.compile(
+        r"([\u4e00-\u9fff々〆ヵヶぁ-んァ-ヴー]{2,20})\s*([12][0-9]{3})年[\s\S]{0,64}?([12][0-9]{3})年"
+    )
+    candidates: dict[str, tuple[int, int, int]] = {}
+
+    def normalize_pm_name(raw: str) -> str:
+        name = raw.strip()
+        # 画像サイズやテンプレート断片、代数表記を先頭から除去する。
+        name = re.sub(r"^(?:[0-9]{2,4}x[0-9]{2,4}|[0-9]{2,4}px|[0-9]+ピクセル|frameless|upright=0\.[0-9]+|第[0-9\-]+代)+", "", name)
+        name = re.sub(r"^(?:第?[0-9一二三四五六七八九十\-]*次)?内閣", "", name)
+        name = re.sub(r"^次内閣", "", name)
+        name = re.sub(r"^(?:第[0-9\-]+代)", "", name)
+        name = re.sub(r"^(?:ピクセル|px)+", "", name)
+        name = name.strip()
+        if not re.fullmatch(r"[\u4e00-\u9fff々〆ヵヶぁ-んァ-ヴー]{2,20}", name):
+            return ""
+        return name
+
+    for _, body in context_sources:
+        for raw_name, start_s, end_s in pattern.findall(body):
+            name = normalize_pm_name(raw_name)
+            if not name:
+                continue
+            start_y = int(start_s)
+            end_y = int(end_s)
+            if end_y < start_y:
+                continue
+            duration = end_y - start_y + 1
+            previous = candidates.get(name)
+            if previous is None or duration > previous[0]:
+                candidates[name] = (duration, start_y, end_y)
+
+    if not candidates:
+        return ""
+
+    ranked = sorted(
+        candidates.items(),
+        key=lambda item: (item[1][0], item[1][2], item[1][1]),
+        reverse=True,
+    )[:top_n]
+
+    lines = [
+        f"参照資料から抽出できた範囲で、日本の歴代首相を任期が長い順に{top_n}人示します。",
+        "",
+    ]
+    for idx, (name, (duration, start_y, end_y)) in enumerate(ranked, start=1):
+        lines.append(f"{idx}. {name}（{start_y}年 - {end_y}年、約{duration}年）")
+
+    lines.append("")
+    lines.append("注記: 上記は今回取得した参照本文から機械抽出した結果です。")
+    return "\n".join(lines).strip()
 
 
 def _rerank_docs_by_query_relevance(docs: list[dict], query: str, sub_queries: list[str]) -> list[dict]:
@@ -1361,12 +1407,12 @@ async def _retrieve_rag_docs(
     import asyncpg
 
     if force_rule_based:
-        _, all_vector_queries, all_title_queries = _extract_search_queries_rule_based(query)
+        _, all_vector_queries = _extract_search_queries_rule_based(query)
         extraction_mode = "rule_based_fast"
     else:
-        _, all_vector_queries, all_title_queries, extraction_mode = await _extract_search_queries(query)
+        _, all_vector_queries, extraction_mode = await _extract_search_queries(query)
     latin_terms = list(dict.fromkeys([token.lower() for token in _RE_LATIN_TOKEN.findall(query)]))
-    subject_terms = set(re.findall(r"の([^の\s、。]{1,20})について", query))
+    is_tourism_query = _is_tourism_intent_query(query)
 
     def extract_parallel_subject_terms(text: str) -> list[str]:
         cleaned = _RE_DETAIL_SPEC.sub("", text).strip("。 \t\n")
@@ -1421,7 +1467,7 @@ async def _retrieve_rag_docs(
                     break
         vector_queries = [all_vector_queries[0], extra_query]
     # 観光/イベント系は地名+意図語の補助ベクトルを1本追加してノイズ耐性を上げる
-    elif any(k in query for k in ("観光", "イベント", "祭", "祭り", "春", "花見")):
+    elif is_tourism_query:
         for candidate in all_vector_queries[1:]:
             if any(k in candidate for k in ("観光", "イベント", "祭", "祭り")):
                 vector_queries = [all_vector_queries[0], candidate]
@@ -1436,94 +1482,27 @@ async def _retrieve_rag_docs(
 
     if vector_query_limit is not None:
         limited = max(1, int(vector_query_limit))
+        if is_tourism_query:
+            # 観光系は地名だけだと誤近傍になりやすいため、補助クエリを最低1本追加する。
+            limited = max(2, limited)
         vector_queries = vector_queries[:limited]
 
-    title_candidates = list(dict.fromkeys(all_title_queries))
-
-    # ユーザー質問の「XのYについて」から Y を主題語として抽出し、
-    # 正式名称バリエーション（例: 狸小路 -> 狸小路商店街）を優先候補へ追加する。
-    query_title_terms = []
-    for term in re.findall(r"の([^の\s、。]{1,20})について", query):
-        query_title_terms.append(term)
-    for term in re.findall(r"([^の\s、。]{1,20})の", query):
-        query_title_terms.append(term)
-    query_title_terms = [
-        t for t in query_title_terms if t and t not in _GENERIC_SECONDARY_QUERIES and len(t) >= 2
-    ]
-    query_title_terms = list(dict.fromkeys(query_title_terms + parallel_subject_terms))
-    query_title_terms = _expand_canonical_variants(query_title_terms)
-    title_candidates = list(dict.fromkeys(query_title_terms + title_candidates))
-
-    if latin_terms:
-        boosted_latin = []
-        for token in latin_terms:
-            boosted_latin.extend([token, token.capitalize()])
-            for variant in _LATIN_QUERY_VARIANTS.get(token, []):
-                boosted_latin.append(variant)
-        title_candidates = list(dict.fromkeys(boosted_latin + title_candidates))
-
-    if not title_candidates and len(all_vector_queries) > 1:
-        # タイトル候補が空のときは補助ベクトル語をフォールバック採用
-        title_candidates = [q for q in all_vector_queries[1:] if len(q) <= 24][:2]
-
     location_heads = set(re.findall(r"([^の\s、。]{1,14})\u306e", query))
-    parallel_subject_terms_prioritized = _expand_canonical_variants(parallel_subject_terms)
-    subject_terms_prioritized = _expand_canonical_variants(
-        list(dict.fromkeys(sorted(subject_terms) + parallel_subject_terms))
-    )
-    subject_terms_expanded = set(subject_terms_prioritized)
 
-    def title_priority(term: str) -> tuple[int, int]:
-        score = 0
-        if any(k in term for k in ("観光", "名所", "イベント", "祭", "桜", "春")):
-            score += 30
-        if subject_terms_expanded and any(st and st in term for st in subject_terms_expanded):
-            score += 70
-        if len(term) > 18:
-            score -= 35
-        if any(k in term for k in ("概要", "歴史", "機能", "使い方", "解説")):
-            score -= 30
-        if " " in term:
-            score += 8
-        if term in location_heads:
-            score += 45
-        if term.startswith("特に"):
-            score -= 20
-        if term in _GENERIC_SECONDARY_QUERIES:
-            score -= 20
-        # 同点時は短い見出し語を優先する。
-        return score, -len(term)
-
-    title_candidates.sort(key=title_priority, reverse=True)
-
-    # 英字固有名詞はタイトル一致検索の強シグナルなので、優先候補から落とさない。
-    # 例: "firebaseを説明して" では Firebase を必ず title_search に流す。
-    title_queries: list[str] = []
-    if latin_terms:
-        for token in latin_terms[:2]:
-            for variant in (token, token.capitalize()):
-                if variant not in title_queries:
-                    title_queries.append(variant)
-
-    preferred_subject_candidates = [
-        term for term in subject_terms_prioritized if term and term not in _GENERIC_SECONDARY_QUERIES
-    ]
-    for term in parallel_subject_terms_prioritized:
-        if term and term not in _GENERIC_SECONDARY_QUERIES and term not in preferred_subject_candidates:
-            preferred_subject_candidates.append(term)
-    merged_title_candidates = list(dict.fromkeys(preferred_subject_candidates + title_candidates))
-
-    for candidate in merged_title_candidates:
-        if candidate in title_queries:
-            continue
-        title_queries.append(candidate)
-
-    title_queries = title_queries[:4] if (latin_terms or parallel_subject_terms) else title_queries[:2]
-    # アンカー語は検索に使わない分も保持して再ランキングで活用
+    # アンカー語はベクトル補助クエリ由来のみを使う。
     anchor_terms = [q for q in all_vector_queries[1:4] if q]
-    for tq in title_queries:
-        if tq and tq not in anchor_terms:
-            anchor_terms.append(tq)
+    if is_tourism_query and anchor_terms:
+        filtered_anchor_terms = []
+        for term in anchor_terms:
+            has_intent_token = any(
+                keyword in term
+                for keyword in ("観光", "名所", "観光地", "イベント", "祭", "祭り")
+            )
+            if term in location_heads and not has_intent_token:
+                continue
+            filtered_anchor_terms.append(term)
+        if filtered_anchor_terms:
+            anchor_terms = filtered_anchor_terms
 
     async def embed_one(text: str) -> list[float]:
         cached = _lru_get(_embed_cache, text)
@@ -1548,73 +1527,35 @@ async def _retrieve_rag_docs(
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT article_id AS id, title, content
-                FROM search_documents_v2_dedup($1::vector, $2::int, $3::int)
+                WITH ann AS (
+                    SELECT
+                        d.article_id AS id,
+                        d.chunk_index,
+                        d.title,
+                        d.content,
+                        (d.embedding <=> $1::vector) AS dist
+                    FROM documents_v2 d
+                    ORDER BY d.embedding <=> $1::vector
+                    LIMIT $2::int
+                )
+                SELECT id, chunk_index, title, content, dist
+                FROM ann
+                ORDER BY dist ASC
+                LIMIT $3::int
                 """,
                 emb_str,
-                match_count,
                 oversampling,
+                match_count,
             )
-        return [{"id": r["id"], "title": r["title"], "content": r["content"]} for r in rows]
-
-    async def title_search(pool: "asyncpg.Pool", noun: str) -> list[dict]:
-        normalized_noun = _normalize_query_term(noun)
-        if not normalized_noun:
-            return []
-
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                                WITH candidates AS (
-                                    SELECT article_id, title, content, chunk_index
-                                    FROM (
-                                        SELECT article_id, title, content, chunk_index
-                                        FROM documents_v2
-                                        WHERE title = $1
-                                        LIMIT 16
-                                    ) t1
-
-                                    UNION ALL
-
-                                    SELECT article_id, title, content, chunk_index
-                                    FROM (
-                                        SELECT article_id, title, content, chunk_index
-                                        FROM documents_v2
-                                        WHERE title = $2
-                                        LIMIT 16
-                                    ) t2
-
-                                    UNION ALL
-
-                                    SELECT article_id, title, content, chunk_index
-                                    FROM (
-                                        SELECT article_id, title, content, chunk_index
-                                        FROM documents_v2
-                                        WHERE title LIKE $3
-                                        LIMIT 32
-                                    ) t3
-                                )
-                                SELECT DISTINCT ON (article_id)
-                                    article_id AS id,
-                                    title,
-                                    content
-                                FROM candidates
-                                ORDER BY article_id, chunk_index ASC
-                                LIMIT 48
-                """,
-                f"{normalized_noun}一覧",
-                normalized_noun,
-                f"{normalized_noun}%",
-            )
-        docs = [{"id": r["id"], "title": r["title"], "content": r["content"]} for r in rows]
-        scored_docs: list[tuple[float, int, dict]] = []
-        for doc in docs:
-            title = str(doc["title"])
-            score = _score_title_match(title, normalized_noun)
-            scored_docs.append((score, -len(title), doc))
-
-        scored_docs.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [item[2] for item in scored_docs[:10]]
+        return [
+            {
+                "id": r["id"],
+                "chunk_index": r["chunk_index"],
+                "title": r["title"],
+                "content": r["content"],
+            }
+            for r in rows
+        ]
 
     async def wrapped_search(task_type: str, coro: "asyncio.Future[list[dict]]") -> tuple[str, list[dict] | None, Exception | None]:
         try:
@@ -1647,13 +1588,10 @@ async def _retrieve_rag_docs(
         tasks: list["asyncio.Future[tuple[str, list[dict] | None, Exception | None]]"] = []
         for emb in embs:
             tasks.append(wrapped_search("vector", limited(search_one(pool, emb))))
-        for tq in title_queries:
-            tasks.append(wrapped_search("title", limited(title_search(pool, tq))))
 
         results = await _asyncio.gather(*tasks)
 
         vector_lists: list[list[dict]] = []
-        title_lists: list[list[dict]] = []
         error_count = 0
         for task_type, result, err in results:
             if err is not None:
@@ -1662,10 +1600,7 @@ async def _retrieve_rag_docs(
                 continue
             if result is None:
                 continue
-            if task_type == "vector":
-                vector_lists.append(result)
-            else:
-                title_lists.append(result)
+            vector_lists.append(result)
 
         if error_count > 0:
             print(
@@ -1673,31 +1608,13 @@ async def _retrieve_rag_docs(
                 file=_sys.stderr,
             )
 
-        # vector が失敗した場合のフォールバック:
-        # 2番目候補のタイトル検索を追加実行し、title-only の取りこぼしを減らす
-        if not vector_lists and len(title_candidates) > 1:
-            fallback_term = title_candidates[1]
-            try:
-                fallback_docs = await limited(title_search(pool, fallback_term))
-                if fallback_docs:
-                    title_lists.append(fallback_docs)
-                    print(
-                        f"[_retrieve_rag_docs] fallback title_search succeeded: {fallback_term}",
-                        file=_sys.stderr,
-                    )
-            except Exception as fallback_err:  # noqa: BLE001
-                print(
-                    f"[_retrieve_rag_docs] fallback title_search failed: {fallback_err}",
-                    file=_sys.stderr,
-                )
     finally:
         await pool.close()
 
     primary_vector_docs = vector_lists[0] if vector_lists else []
     secondary_vector_lists = vector_lists[1:] if len(vector_lists) > 1 else []
-    docs = _merge_ranked_docs(primary_vector_docs, secondary_vector_lists, title_lists, anchor_terms)
+    docs = _merge_ranked_docs(primary_vector_docs, secondary_vector_lists, anchor_terms)
 
-    is_tourism_query = any(k in query for k in ("観光", "イベント", "祭", "祭り", "春", "花見"))
     if is_tourism_query and docs:
         anchor_parts = [
             part
@@ -1714,7 +1631,7 @@ async def _retrieve_rag_docs(
             if filtered_docs:
                 docs = filtered_docs
 
-    rerank_queries = list(dict.fromkeys([*all_vector_queries, *title_queries]))
+    rerank_queries = list(dict.fromkeys(all_vector_queries))
     docs = _rerank_docs_by_query_relevance(docs, query, rerank_queries)
 
     relevance_terms = _collect_relevance_terms(query, rerank_queries)
@@ -1729,7 +1646,7 @@ async def _retrieve_rag_docs(
     ranked_top20_docs = docs[:20]
 
     # Gemma 入力は最大 3 件（ランキング上位を優先）
-    return docs[:3], vector_queries, title_lists, extraction_mode, ranked_top20_docs
+    return docs[:3], vector_queries, [], extraction_mode, ranked_top20_docs
 
 
 def _parse_selected_doc_ids(raw: str) -> list[int]:
@@ -1752,7 +1669,7 @@ def _parse_selected_doc_ids(raw: str) -> list[int]:
 async def rag_rankings(query: str) -> str:
     """質問に対するRAG検索ランキング上位20件をJSONで返す。"""
     db_url: str = get_db_url()
-    use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "1") != "0"
+    use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "0") != "0"
     report_vector_query_limit = int(os.environ.get("RAG_REPORT_VECTOR_QUERY_LIMIT", "1"))
     _, sub_queries, _, extraction_mode, ranked_top20_docs = await _retrieve_rag_docs(
         query,
@@ -1778,11 +1695,11 @@ async def rag_rankings(query: str) -> str:
 
 
 @mcp.tool()
-async def rag_answer_report(query: str, top_k: int = 3) -> str:
+async def rag_answer_report(query: str, top_k: int = 3, selected_doc_ids: str = "") -> str:
     """質問に対するRAG回答と計測情報をJSONで返す（top_kは最大3）。"""
     db_url: str = get_db_url()
     effective_top_k = 3 if top_k <= 0 else min(int(top_k), 3)
-    use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "1") != "0"
+    use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "0") != "0"
     report_vector_query_limit = int(os.environ.get("RAG_REPORT_VECTOR_QUERY_LIMIT", "1"))
 
     search_started = time.perf_counter()
@@ -1792,6 +1709,18 @@ async def rag_answer_report(query: str, top_k: int = 3) -> str:
         force_rule_based=use_rule_based,
         vector_query_limit=report_vector_query_limit,
     )
+    selected_ids = _parse_selected_doc_ids(selected_doc_ids)
+    if selected_ids and ranked_top20_docs:
+        selected_set = set(selected_ids)
+        selected_docs = [doc for doc in ranked_top20_docs if int(doc["id"]) in selected_set]
+
+        if selected_docs:
+            docs = selected_docs
+            # ランキング情報は選択記事を先頭に寄せて返す（残りは元順維持）。
+            selected_set = {int(doc["id"]) for doc in selected_docs}
+            remaining_docs = [doc for doc in ranked_top20_docs if int(doc["id"]) not in selected_set]
+            ranked_top20_docs = [*selected_docs, *remaining_docs][:20]
+
     relevance_terms = _collect_relevance_terms(query, sub_queries)
 
     docs = _rerank_docs_by_query_relevance(docs, query, sub_queries)
@@ -1825,6 +1754,10 @@ async def rag_answer_report(query: str, top_k: int = 3) -> str:
     answer_started = time.perf_counter()
     answer_error = ""
     context_chunk_sizes: list[dict[str, int | str]] = []
+    llm_prompt_system = ""
+    llm_prompt_user = ""
+    llm_prompt_assistant_prefill = ""
+    llm_prompt_full = ""
     max_context_chars = int(os.environ.get("RAG_REPORT_MAX_CONTEXT_CHARS", "10000"))
     llm_preset_name = "qa_rag"
     llm_preset = _LLAMA_PRESETS.get(llm_preset_name, {})
@@ -1883,11 +1816,19 @@ async def rag_answer_report(query: str, top_k: int = 3) -> str:
                 f"{rag_messages[1]['content']}\n\n"
                 f"{prefill}"
             )
+            llm_prompt_system = rag_messages[0]["content"]
+            llm_prompt_user = rag_messages[1]["content"]
+            llm_prompt_assistant_prefill = prefill
+            llm_prompt_full = llm_prompt
             try:
                 llm_text = await asyncio.to_thread(_run_llama_with_preset, llm_prompt, llm_preset_name)
                 answer = _sanitize_rag_answer_text(prefill + llm_text.strip())
                 if not answer:
                     answer = "回答を生成できませんでした。"
+                elif not _answer_has_context_signals(answer, context_sources):
+                    fallback_answer = _build_grounded_fallback_answer(query, context_sources)
+                    if fallback_answer:
+                        answer = fallback_answer
             except Exception as exc:  # noqa: BLE001
                 answer_error = str(exc)
                 answer = (
@@ -1898,6 +1839,18 @@ async def rag_answer_report(query: str, top_k: int = 3) -> str:
     answer_time_ms = int((time.perf_counter() - answer_started) * 1000)
     total_time_ms = search_time_ms + answer_time_ms
     now_jst = datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(timespec="seconds")
+    report_vector_query_limit = int(os.environ.get("RAG_REPORT_VECTOR_QUERY_LIMIT", "1"))
+    rag_vector_match_count = int(os.environ.get("RAG_VECTOR_MATCH_COUNT", "8"))
+    rag_vector_oversampling = int(os.environ.get("RAG_VECTOR_OVERSAMPLING", "24"))
+    rag_db_max_concurrency = int(os.environ.get("RAG_DB_MAX_CONCURRENCY", "4"))
+    rag_db_query_timeout_sec = float(os.environ.get("RAG_DB_QUERY_TIMEOUT_SEC", "25"))
+    rag_embed_cache_max = int(os.environ.get("RAG_EMBED_CACHE_MAX", "512"))
+    query_normalization_timeout_sec = float(
+        os.environ.get("RAG_QUERY_NORMALIZATION_TIMEOUT_SEC", "25")
+    )
+    query_normalization_num_predict = int(
+        os.environ.get("RAG_QUERY_NORMALIZATION_NUM_PREDICT", "192")
+    )
 
     payload = {
         "query": query,
@@ -1912,16 +1865,43 @@ async def rag_answer_report(query: str, top_k: int = 3) -> str:
         "answer": answer,
         "runtime_parameters": {
             "model_path": MODEL_PATH,
+            "llm_model": "llama_cpp.Llama",
+            "llm_context_window": 8192,
+            "llm_threads": 8,
+            "llm_gpu_layers": -1,
+            "llm_batch_size": 512,
             "llm_preset": llm_preset_name,
             "max_context_chars": max_context_chars,
             "content_preview_chars": content_preview_chars,
             "effective_top_k": effective_top_k,
+            "db_empty_detected": db_empty,
+            "low_relevance_detected": low_relevance,
+            "extraction_mode_forced_rule_based": use_rule_based,
+            "vector_query_limit": report_vector_query_limit,
+            "rag_vector_match_count": rag_vector_match_count,
+            "rag_vector_oversampling": rag_vector_oversampling,
+            "rag_db_max_concurrency": rag_db_max_concurrency,
+            "rag_db_query_timeout_sec": rag_db_query_timeout_sec,
+            "rag_embed_cache_max": rag_embed_cache_max,
+            "query_normalization_timeout_sec": query_normalization_timeout_sec,
+            "query_normalization_num_predict": query_normalization_num_predict,
+            "embedding_model": _EMBEDDING_MODEL,
+            "embedding_batch_size": _EMBEDDING_BATCH_SIZE,
+            "embedding_max_length": _EMBEDDING_MAX_LENGTH,
+            "selected_doc_ids": selected_ids,
+            "selected_doc_count": len(selected_ids),
             "llm_params": {
                 "max_tokens": int(llm_preset.get("max_tokens", 0)),
                 "temperature": float(llm_preset.get("temperature", 0.0)),
                 "top_k": int(llm_preset.get("top_k", 0)),
                 "repeat_penalty": float(llm_preset.get("repeat_penalty", 0.0)),
             },
+        },
+        "llm_prompt": {
+            "system": llm_prompt_system,
+            "user": llm_prompt_user,
+            "assistant_prefill": llm_prompt_assistant_prefill,
+            "full_prompt": llm_prompt_full,
         },
         "context_chunk_sizes": context_chunk_sizes,
         "top_docs": top_docs_payload,
@@ -1950,6 +1930,7 @@ def _build_rag_messages(context: str, user_prompt: str) -> list[dict[str, str]]:
         "- 参照資料の情報を最大限引用・活用して回答すること。資料に豊富な情報がある場合は省略せず詳細に記述。\n"
         "- 文字数指定がある場合は必ずその文字数を目安に記述すること。沿革・組織・特色・研究など複数の観点から網羅的に解説。\n"
         "- 箇条書き中心ではなく、段落形式の説明文で記述。\n"
+        "- 参照資料のタイトルに含まれる固有名詞を、回答本文に明示的に含めること。\n"
         "- 逆質問や前置きは不要。\n"
         "- 数学に関しての回答は参照資料にある公式と用語を使うこと。\n"
         "- 参照資料に含まれない事実を創作しないこと。"
@@ -2020,7 +2001,7 @@ async def rag_ask(
         )
     else:
         # ask-wiki は ask-wiki-report と同じ検索条件を使う。
-        use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "1") != "0"
+        use_rule_based = os.environ.get("RAG_REPORT_USE_RULE_BASED_EXTRACTOR", "0") != "0"
         report_vector_query_limit = int(os.environ.get("RAG_REPORT_VECTOR_QUERY_LIMIT", "1"))
         docs, sub_queries, title_lists, extraction_mode, ranked_top20_docs = await _retrieve_rag_docs(
             query,
@@ -2073,8 +2054,9 @@ async def rag_ask(
         compare_max_docs = max(1, int(os.environ.get("KB_COMPARE_RAG_MAX_DOCS", "4")))
         # 通常ask-wikiはreportと同じ上位3件を使用。compareでは選択順を尊重しつつ上限を低めにする。
         if is_compare_mode:
-            target_docs_for_gemma = min(compare_max_docs, len(docs)) if selected_ids else 2
-            llm_preset_name = "qa_non_rag"
+            # compareでも既定2件に固定せず、上位候補を十分に使ってランキング抽出を安定化する。
+            target_docs_for_gemma = min(compare_max_docs, len(docs))
+            llm_preset_name = "qa_rag"
             max_context_chars = int(os.environ.get("KB_COMPARE_RAG_MAX_CONTEXT_CHARS", "9000"))
         else:
             target_docs_for_gemma = min(3, len(docs))
@@ -2204,6 +2186,22 @@ async def rag_ask(
         # assistant prefill + 生成結果を結合して完全な回答にする
         answer = prefill + answer
 
+        # compareモードでは「〜教えてください」の問い返しを抑止し、
+        # 根拠語が不足する回答は参照コンテキストベースへフォールバックする。
+        if is_compare_mode:
+            ranked_pm_answer = _build_prime_minister_tenure_answer(query, context_sources)
+            if ranked_pm_answer:
+                answer = ranked_pm_answer
+            else:
+                normalized_answer = answer.strip()
+                looks_like_instruction = bool(
+                    re.match(r"^.{0,80}(?:教えてください|示してください|回答してください)[。.!！?？]*$", normalized_answer)
+                )
+                if looks_like_instruction or (not _answer_has_context_signals(normalized_answer, context_sources)):
+                    fallback_answer = _build_grounded_fallback_answer(query, context_sources)
+                    if fallback_answer:
+                        answer = fallback_answer
+
         # llama-cpp Python API では詳細トークン計測値を常に取得できないため、件数中心でログ出力する。
         print(
             f"[rag_ask] context={total_ctx_chars:,}文字"
@@ -2216,13 +2214,9 @@ async def rag_ask(
         # 参照元タイトル一覧（Gemmaへ渡した順序）
         sources_list_md = "\n".join([f"- 【{title}】" for title, _ in context_sources])
         # 参照元Wikipedia本文（Gemmaへ実際に渡した本文をそのまま保存）
-        if is_compare_mode:
-            # compare-wiki は回答抽出が主目的のため、巨大な本文保存を省略してI/O負荷を下げる。
-            sources_body_md = "（compareモードのため省略）"
-        else:
-            sources_body_md = "\n\n---\n\n".join(
-                [f"### 【{title}】\n\n{body}" for title, body in context_sources]
-            )
+        sources_body_md = "\n\n---\n\n".join(
+            [f"### 【{title}】\n\n{body}" for title, body in context_sources]
+        )
 
         source_char_lines = (
             "\n".join([f"  - 【{title}】: {size:,}文字" for title, size in source_char_stats])

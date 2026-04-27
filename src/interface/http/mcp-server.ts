@@ -100,11 +100,19 @@ function createMcpServer(): McpServer {
       inputSchema: {
         query: z.string().min(1).describe("質問文字列"),
         topK: z.number().int().min(1).max(3).optional().describe("取得件数（固定3推奨）"),
+        selectedDocIds: z
+          .array(z.number().int().positive())
+          .optional()
+          .describe("使用するWikipedia記事ID（0〜20件）"),
       },
     },
-    async ({ query, topK = 3 }) => {
+    async ({ query, topK = 3, selectedDocIds = [] }) => {
       console.log(`[MCP] ask_wiki_rag_report: "${query}" topK=${topK}`);
-      const report = await runPythonRAGReport(query, Math.min(3, Math.max(1, topK)));
+      const report = await runPythonRAGReport(
+        query,
+        Math.min(3, Math.max(1, topK)),
+        selectedDocIds,
+      );
       return jsonText(report);
     },
   );
@@ -137,6 +145,8 @@ function createMcpServer(): McpServer {
         title,
         tags,
         createRagDoc: (q, t) => runPythonRAGDoc(q, t, selectedDocIdsForCompare, "compare"),
+        createRagReport: (q, topK = 3) =>
+          runPythonRAGReport(q, Math.min(3, Math.max(1, topK)), selectedDocIdsForCompare),
         createWikiDoc: (keyword, wikiTags) => createDocFromWikipedia({ keyword, tags: wikiTags }),
         summarize: (prompt) => runPythonSummaryWithMode(prompt, "compare_non_rag_light"),
       });

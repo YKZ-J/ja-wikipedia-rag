@@ -9,6 +9,58 @@ type CreateRagComparisonInput = {
   title?: string;
   tags?: string[];
   createRagDoc: (query: string, tags?: string[]) => Promise<string>;
+  createRagReport: (
+    query: string,
+    topK?: number,
+  ) => Promise<{
+    query: string;
+    top_k: number;
+    generated_at: string;
+    extraction_mode: string;
+    search_queries: string[];
+    search_time_ms: number;
+    answer_time_ms: number;
+    total_time_ms: number;
+    answer_error: string;
+    runtime_parameters: {
+      model_path: string;
+      llm_model?: string;
+      llm_context_window?: number;
+      llm_threads?: number;
+      llm_gpu_layers?: number;
+      llm_batch_size?: number;
+      llm_preset: string;
+      max_context_chars: number;
+      content_preview_chars: number;
+      effective_top_k: number;
+      db_empty_detected?: boolean;
+      low_relevance_detected?: boolean;
+      extraction_mode_forced_rule_based?: boolean;
+      vector_query_limit?: number;
+      rag_vector_match_count?: number;
+      rag_vector_oversampling?: number;
+      rag_db_max_concurrency?: number;
+      rag_db_query_timeout_sec?: number;
+      rag_embed_cache_max?: number;
+      query_normalization_timeout_sec?: number;
+      query_normalization_num_predict?: number;
+      embedding_model?: string;
+      embedding_batch_size?: number;
+      embedding_max_length?: number;
+      llm_params: {
+        max_tokens: number;
+        temperature: number;
+        top_k: number;
+        repeat_penalty: number;
+      };
+    };
+    llm_prompt?: {
+      system: string;
+      user: string;
+      assistant_prefill: string;
+      full_prompt: string;
+    };
+  }>;
   createWikiDoc: (keyword: string, tags?: string[]) => Promise<string>;
   summarize: (prompt: string) => Promise<string>;
 };
@@ -84,7 +136,7 @@ function extractRagAnswer(markdown: string): string {
 
 function extractSearchQueries(markdown: string): string[] {
   const section = markdown.match(
-    /(?:^|\n)#\s*検索クエリ\s*\(実際に使用\)\s*\n([\s\S]*?)(?:\n#\s*参照元|\s*$)/,
+    /(?:^|\n)#\s*検索クエリ\s*\(実際に使用\)\s*\n([\s\S]*?)(?:\n#\s*|\s*$)/,
   );
 
   if (!section?.[1]) return [];
@@ -95,6 +147,142 @@ function extractSearchQueries(markdown: string): string[] {
     .filter((line) => line.startsWith("-"))
     .map((line) => line.replace(/^-\s*/, "").replace(/^`|`$/g, "").trim())
     .filter(Boolean);
+}
+
+function buildAskWikiReportCompatibleParams(report: {
+  query: string;
+  top_k: number;
+  generated_at: string;
+  extraction_mode: string;
+  search_queries: string[];
+  search_time_ms: number;
+  answer_time_ms: number;
+  total_time_ms: number;
+  answer_error: string;
+  runtime_parameters: {
+    model_path: string;
+    llm_model?: string;
+    llm_context_window?: number;
+    llm_threads?: number;
+    llm_gpu_layers?: number;
+    llm_batch_size?: number;
+    llm_preset: string;
+    max_context_chars: number;
+    content_preview_chars: number;
+    effective_top_k: number;
+    db_empty_detected?: boolean;
+    low_relevance_detected?: boolean;
+    extraction_mode_forced_rule_based?: boolean;
+    vector_query_limit?: number;
+    rag_vector_match_count?: number;
+    rag_vector_oversampling?: number;
+    rag_db_max_concurrency?: number;
+    rag_db_query_timeout_sec?: number;
+    rag_embed_cache_max?: number;
+    query_normalization_timeout_sec?: number;
+    query_normalization_num_predict?: number;
+    embedding_model?: string;
+    embedding_batch_size?: number;
+    embedding_max_length?: number;
+    llm_params: {
+      max_tokens: number;
+      temperature: number;
+      top_k: number;
+      repeat_penalty: number;
+    };
+  };
+}): string[] {
+  const answerError = report.answer_error?.trim() ? report.answer_error : "(none)";
+
+  return [
+    "# Timings",
+    `- search_time_ms: ${report.search_time_ms}`,
+    `- answer_time_ms: ${report.answer_time_ms}`,
+    `- total_time_ms: ${report.total_time_ms}`,
+    `- answer_error: ${answerError}`,
+    "# Report Meta",
+    `- query: ${report.query}`,
+    `- top_k: ${report.top_k}`,
+    `- generated_at: ${report.generated_at}`,
+    `- extraction_mode: ${report.extraction_mode}`,
+    `- search_queries_count: ${report.search_queries.length}`,
+    "# Runtime Parameters",
+    `- model_path: ${report.runtime_parameters.model_path}`,
+    `- llm_model: ${report.runtime_parameters.llm_model ?? "(default)"}`,
+    `- llm_context_window: ${report.runtime_parameters.llm_context_window ?? "(default)"}`,
+    `- llm_threads: ${report.runtime_parameters.llm_threads ?? "(default)"}`,
+    `- llm_gpu_layers: ${report.runtime_parameters.llm_gpu_layers ?? "(default)"}`,
+    `- llm_batch_size: ${report.runtime_parameters.llm_batch_size ?? "(default)"}`,
+    `- llm_preset: ${report.runtime_parameters.llm_preset}`,
+    `- max_context_chars: ${report.runtime_parameters.max_context_chars}`,
+    `- content_preview_chars: ${report.runtime_parameters.content_preview_chars}`,
+    `- effective_top_k: ${report.runtime_parameters.effective_top_k}`,
+    `- db_empty_detected: ${report.runtime_parameters.db_empty_detected ?? false}`,
+    `- low_relevance_detected: ${report.runtime_parameters.low_relevance_detected ?? false}`,
+    `- extraction_mode_forced_rule_based: ${report.runtime_parameters.extraction_mode_forced_rule_based ?? false}`,
+    `- vector_query_limit: ${report.runtime_parameters.vector_query_limit ?? "(default)"}`,
+    `- rag_vector_match_count: ${report.runtime_parameters.rag_vector_match_count ?? "(default)"}`,
+    `- rag_vector_oversampling: ${report.runtime_parameters.rag_vector_oversampling ?? "(default)"}`,
+    `- rag_db_max_concurrency: ${report.runtime_parameters.rag_db_max_concurrency ?? "(default)"}`,
+    `- rag_db_query_timeout_sec: ${report.runtime_parameters.rag_db_query_timeout_sec ?? "(default)"}`,
+    `- rag_embed_cache_max: ${report.runtime_parameters.rag_embed_cache_max ?? "(default)"}`,
+    `- query_normalization_timeout_sec: ${report.runtime_parameters.query_normalization_timeout_sec ?? "(default)"}`,
+    `- query_normalization_num_predict: ${report.runtime_parameters.query_normalization_num_predict ?? "(default)"}`,
+    `- embedding_model: ${report.runtime_parameters.embedding_model ?? "(default)"}`,
+    `- embedding_batch_size: ${report.runtime_parameters.embedding_batch_size ?? "(default)"}`,
+    `- embedding_max_length: ${report.runtime_parameters.embedding_max_length ?? "(default)"}`,
+    `- llm.max_tokens: ${report.runtime_parameters.llm_params.max_tokens}`,
+    `- llm.temperature: ${report.runtime_parameters.llm_params.temperature}`,
+    `- llm.top_k: ${report.runtime_parameters.llm_params.top_k}`,
+    `- llm.repeat_penalty: ${report.runtime_parameters.llm_params.repeat_penalty}`,
+  ];
+}
+
+function buildLlmPromptBlock(report: {
+  llm_prompt?: {
+    system: string;
+    user: string;
+    assistant_prefill: string;
+    full_prompt: string;
+  };
+}): string[] {
+  const prompt = report.llm_prompt;
+  if (!prompt) {
+    return ["- （取得なし）"];
+  }
+
+  const lines: string[] = [];
+
+  const pushSection = (title: string, body: string): void => {
+    lines.push(`# ${title}`);
+    if (!body) {
+      lines.push("(empty)");
+    } else {
+      lines.push(...body.split("\n"));
+    }
+    lines.push("");
+  };
+
+  pushSection("system", prompt.system || "");
+  pushSection("user", prompt.user || "");
+  pushSection("assistant_prefill", prompt.assistant_prefill || "");
+  lines.push("# full_prompt");
+  lines.push(
+    `(system + user + assistant_prefill の連結。重複表示を避けるため本文は省略。chars=${prompt.full_prompt.length})`,
+  );
+
+  return lines;
+}
+
+function extractSourceBodies(markdown: string): string {
+  const section = markdown.match(/(?:^|\n)#\s*参照元\s*Wikipedia\s*本文\s*\n([\s\S]*?)\s*$/);
+
+  if (!section?.[1]) return "";
+  return section[1].trim();
+}
+
+function toQuotedBlockPreserveIndent(lines: string[]): string {
+  return lines.map((line) => (line.length === 0 ? ">" : `> ${line}`)).join("\n");
 }
 
 function extractWikipediaTitles(markdown: string): string[] {
@@ -142,9 +330,21 @@ function createArticleBody(params: {
   ragAnswer: string;
   nonRagAnswer: string;
   ragQueries: string[];
+  ragReportParams: string[];
+  ragLlmPromptLines: string[];
   wikiTitles: string[];
+  ragSourceBodies: string;
 }): string {
-  const { query, ragAnswer, nonRagAnswer, ragQueries, wikiTitles } = params;
+  const {
+    query,
+    ragAnswer,
+    nonRagAnswer,
+    ragQueries,
+    ragReportParams,
+    ragLlmPromptLines,
+    wikiTitles,
+    ragSourceBodies,
+  } = params;
 
   const ragLines = [
     "---",
@@ -162,10 +362,21 @@ function createArticleBody(params: {
     "**検索クエリ（実際に使用）**",
     "",
     ...(ragQueries.length > 0 ? ragQueries.map((item) => `- \`${item}\``) : ["- （取得なし）"]),
+    ...(ragReportParams.length > 0
+      ? ["", "**パラメータ一覧（ask-wiki-report互換）**", "", ...ragReportParams]
+      : []),
+    "",
+    "**LLMに渡したプロンプト（rag_answer_report実行時）**",
+    "",
+    ...ragLlmPromptLines,
     "",
     "**参照元 Wikipedia 一覧**",
     "",
     ...(wikiTitles.length > 0 ? wikiTitles.map((item) => `- 【${item}】`) : ["- （取得なし）"]),
+    "",
+    "**参照元 Wikipedia 本文**",
+    "",
+    ...(ragSourceBodies ? ragSourceBodies.split("\n") : ["（取得なし）"]),
     "",
     "---",
   ];
@@ -217,7 +428,7 @@ wikipediaダンプ: jawiki-latest-pages-articles.xml.bz2 04-Mar-2026 01:54 45920
 
 ## ① RAGあり出力（Gemma3 + Wikipedia RAG）
 
-${toQuotedBlock(ragLines)}
+${toQuotedBlockPreserveIndent(ragLines)}
 
 ## ② RAGなし出力（Gemma3 単体）
 
@@ -235,6 +446,7 @@ export async function createRagComparisonDoc({
   title,
   tags = [],
   createRagDoc,
+  createRagReport,
   createWikiDoc,
   summarize,
 }: CreateRagComparisonInput): Promise<string> {
@@ -247,7 +459,11 @@ export async function createRagComparisonDoc({
   const ragMarkdown = await readFile(ragFilePath, "utf-8");
   const ragAnswer = extractRagAnswer(ragMarkdown);
   const ragQueries = extractSearchQueries(ragMarkdown);
+  const ragReport = await createRagReport(trimmedQuery, 3);
+  const ragReportParams = buildAskWikiReportCompatibleParams(ragReport);
+  const ragLlmPromptLines = buildLlmPromptBlock(ragReport);
   const wikiTitles = extractWikipediaTitles(ragMarkdown);
+  const ragSourceBodies = extractSourceBodies(ragMarkdown);
 
   const stageGapMs = Math.max(
     0,
@@ -322,7 +538,10 @@ export async function createRagComparisonDoc({
     ragAnswer,
     nonRagAnswer,
     ragQueries,
+    ragReportParams,
+    ragLlmPromptLines,
     wikiTitles,
+    ragSourceBodies,
   });
 
   const outputDir = resolveOutputDir();
